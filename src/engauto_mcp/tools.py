@@ -82,7 +82,13 @@ class ToolService:
         for _ in range(2):
             try:
                 result = await self._db.transaction(
-                    lambda db: self._apply_deployment_patch(db, request.task_id, patch_ops, request.environment)
+                    lambda db, staged: self._apply_deployment_patch(
+                        db,
+                        staged,
+                        request.task_id,
+                        patch_ops,
+                        request.environment,
+                    )
                 )
                 await self._enqueue_deployment(result["task_id"], request.environment)
                 return result
@@ -106,7 +112,7 @@ class ToolService:
         raise JsonRpcError(-32005, "Deployment remediation attempts exhausted.")
 
     async def get_engine_health(self) -> EngineHealth:
-        heartbeat = await self._db.transaction(lambda db: db.write_read_heartbeat())
+        heartbeat = await self._db.transaction(lambda db, staged: db.write_read_heartbeat(staged=staged))
         wal_path = self._db.database_path.with_name(self._db.database_path.name + "-wal")
         wal_size = wal_path.stat().st_size if wal_path.exists() else 0
         persistent_instance_id = await self._db.get_metadata_text("persistent_instance_id")
@@ -126,6 +132,7 @@ class ToolService:
     async def _apply_deployment_patch(
         self,
         db: DatabaseManager,
+        staged: dict[str, tuple[str | None, int | None]],
         task_id: str,
         patch_ops: list[dict[str, Any]],
         environment: dict[str, Any],
@@ -149,8 +156,8 @@ class ToolService:
         updated_document = patch.apply(document, in_place=False)
         updated_document["status"] = "running"
         updated_document["deployment_environment"] = environment
-        updated_task = await db.update_task_document(task, updated_document)
-        await db.set_system_state("DEPLOY_LOCK", value_text="RUNNING")
+        updated_task = await db.update_task_document(task, updated_document, staged=staged)
+        await db.set_system_state("DEPLOY_LOCK", value_text="RUNNING", staged=staged)
         self._subscriptions.emit_resource_updated(f"tasks://{task.status}")
         self._subscriptions.emit_resource_updated(f"tasks://{updated_task.status}")
         return {

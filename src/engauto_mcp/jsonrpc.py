@@ -161,6 +161,9 @@ class StdIOTransport:
 
     async def write_message(self, payload: dict[str, Any]) -> None:
         frame = encode_message(payload)
+        await self.write_message_bytes(frame)
+
+    async def write_message_bytes(self, frame: bytes) -> None:
         async with self._stdout_lock:
             await asyncio.to_thread(self._write_sync, self._stdout_buffer, frame)
 

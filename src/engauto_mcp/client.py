@@ -14,10 +14,21 @@ from .models import SamplingRequest, SamplingResponse
 SamplingHandler = Callable[[SamplingRequest], Awaitable[SamplingResponse]]
 
 
+class _FrameWriter:
+    def __init__(self, write_fn: Callable[[bytes], Awaitable[None]]) -> None:
+        self._write_fn = write_fn
+        self._stdout_lock = asyncio.Lock()
+
+    async def write_message(self, payload: dict[str, Any]) -> None:
+        frame = encode_message(payload)
+        async with self._stdout_lock:
+            await self._write_fn(frame)
+
+
 class SubprocessTransport:
     def __init__(self, process: asyncio.subprocess.Process) -> None:
         self._process = process
-        self._stdout_lock = asyncio.Lock()
+        self._writer = _FrameWriter(self._write_frame)
 
     async def read_message(self) -> dict[str, Any] | None:
         if self._process.stdout is None:
@@ -25,23 +36,28 @@ class SubprocessTransport:
         return await read_message_async(self._process.stdout)
 
     async def write_message(self, payload: dict[str, Any]) -> None:
+        await self._writer.write_message(payload)
+
+    async def _write_frame(self, frame: bytes) -> None:
         if self._process.stdin is None:
             raise RuntimeError("Client subprocess stdin is not available.")
-        frame = encode_message(payload)
-        async with self._stdout_lock:
-            self._process.stdin.write(frame)
-            await self._process.stdin.drain()
+        self._process.stdin.write(frame)
+        await self._process.stdin.drain()
 
 
 class ClientStdIOTransport:
     def __init__(self) -> None:
         self._transport = StdIOTransport()
+        self._writer = _FrameWriter(self._write_frame)
 
     async def read_message(self) -> dict[str, Any] | None:
         return await self._transport.read_message()
 
     async def write_message(self, payload: dict[str, Any]) -> None:
-        await self._transport.write_message(payload)
+        await self._writer.write_message(payload)
+
+    async def _write_frame(self, frame: bytes) -> None:
+        await self._transport.write_message_bytes(frame)
 
 
 class MCPClient:

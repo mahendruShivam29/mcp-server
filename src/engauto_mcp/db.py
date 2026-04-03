@@ -43,7 +43,7 @@ class DatabaseManager:
 
     async def transaction(
         self,
-        callback: Callable[["DatabaseManager"], Awaitable[Any]],
+        callback: Callable[["DatabaseManager", StagedState], Awaitable[Any]],
     ) -> Any:
         self._ensure_connection()
         staged: StagedState = {}
@@ -54,7 +54,7 @@ class DatabaseManager:
             self._task_staging[task_id] = staged
         try:
             await self._execute("BEGIN IMMEDIATE;")
-            result = await callback(self)
+            result = await callback(self, staged)
             await self._commit()
             self._apply_staged_state(staged)
             return result
@@ -92,7 +92,13 @@ class DatabaseManager:
         )
         return [TaskRecord.model_validate(dict(row)) for row in rows]
 
-    async def update_task_document(self, task: TaskRecord, document: dict[str, Any]) -> TaskRecord:
+    async def update_task_document(
+        self,
+        task: TaskRecord,
+        document: dict[str, Any],
+        *,
+        staged: StagedState | None = None,
+    ) -> TaskRecord:
         now = _unix_timestamp()
         next_etag = task.etag + 1
         payload_json = json.dumps(document, sort_keys=True)
@@ -129,6 +135,7 @@ class DatabaseManager:
         *,
         value_text: str | None = None,
         value_integer: int | None = None,
+        staged: StagedState | None = None,
     ) -> None:
         now = _unix_timestamp()
         await self._execute(
@@ -142,8 +149,8 @@ class DatabaseManager:
             """,
             (key, value_text, value_integer, now),
         )
-        self.stage_live_state(key, value_text=value_text, value_integer=value_integer)
-        if self._active_staging() is None:
+        self.stage_live_state(key, value_text=value_text, value_integer=value_integer, staged=staged)
+        if staged is None and self._active_staging() is None:
             await self._commit()
 
     async def get_system_state(self, key: str) -> tuple[str | None, int | None] | None:
@@ -169,9 +176,9 @@ class DatabaseManager:
         )
         return None if row is None else row["value_text"]
 
-    async def write_read_heartbeat(self) -> int:
+    async def write_read_heartbeat(self, *, staged: StagedState | None = None) -> int:
         now = _unix_timestamp()
-        await self.set_system_state("HEARTBEAT", value_integer=now)
+        await self.set_system_state("HEARTBEAT", value_integer=now, staged=staged)
         row = await self._fetchone(
             "SELECT value_integer FROM system_state WHERE key = 'HEARTBEAT'"
         )
@@ -184,8 +191,11 @@ class DatabaseManager:
     async def checkpoint_wal(self) -> None:
         await self._execute("PRAGMA wal_checkpoint(PASSIVE);")
 
-    async def maintenance_checkpoint(self) -> None:
-        await self._execute("PRAGMA wal_checkpoint(RESTART);")
+    async def maintenance_checkpoint(self) -> bool:
+        row = await self._fetchone("PRAGMA wal_checkpoint(RESTART);")
+        if row is None:
+            return False
+        return int(row[0]) == 0
 
     def stage_live_state(
         self,
@@ -193,10 +203,11 @@ class DatabaseManager:
         *,
         value_text: str | None = None,
         value_integer: int | None = None,
+        staged: StagedState | None = None,
     ) -> None:
-        staged = self._active_staging()
-        if staged is not None:
-            staged[key] = (value_text, value_integer)
+        active = staged if staged is not None else self._active_staging()
+        if active is not None:
+            active[key] = (value_text, value_integer)
         else:
             self.live_state[key] = (value_text, value_integer)
 

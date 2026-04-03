@@ -42,12 +42,16 @@ class EngineeringAutomationServer:
     async def start(self) -> None:
         await self.db.open()
         secrets = load_cursor_secrets(self.database_path)
-        self._resources = TaskResourceService(self.db, HmacCursorCodec(secrets))
         self._engine = BackgroundDeploymentEngine(
             self.db,
             self._subscriptions,
             instance_id=secrets.persistent_instance_id,
             log_emitter=self._emit_log_message,
+        )
+        self._resources = TaskResourceService(
+            self.db,
+            HmacCursorCodec(secrets),
+            metric_sink=self._engine.queue_metric,
         )
         await self._engine.start()
         self._tools = ToolService(
@@ -149,7 +153,7 @@ class EngineeringAutomationServer:
     async def _sample_client(self, request: SamplingRequest) -> SamplingResponse:
         if self.peer is None:
             raise JsonRpcError(-32020, "Peer is not ready for sampling.")
-        if not self.client_capabilities.get("sampling"):
+        if "sampling" not in self.client_capabilities:
             raise JsonRpcError(-32004, "Client does not advertise sampling capability.")
         result = await self.peer.send_request("sampling/createMessage", request.model_dump(), timeout=30.0)
         return SamplingResponse.model_validate(result)

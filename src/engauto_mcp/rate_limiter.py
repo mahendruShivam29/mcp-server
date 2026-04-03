@@ -118,7 +118,7 @@ class TieredRateLimiter:
     ) -> RateLimitDecision:
         async with self._lock:
             current_time = time.time() if now is None else now
-            state = await self._read_state(client_id, tier, current_time)
+            state = await self._read_state(self._db, client_id, tier, current_time)
             config = self._config_for(tier)
             self._refill(state, config, current_time)
             return RateLimitDecision(
@@ -137,45 +137,50 @@ class TieredRateLimiter:
     ) -> RateLimitDecision:
         current_time = time.time() if now is None else now
         config = self._config_for(tier)
-        state = await self._read_state(client_id, tier, current_time)
-        self._refill(state, config, current_time)
 
-        if state.tokens >= cost:
-            state.tokens -= cost
-            state.denial_count = 0
-            await self._write_state(client_id, tier, state)
+        async def callback(db: DatabaseManager, staged: dict[str, tuple[str | None, int | None]]) -> RateLimitDecision:
+            state = await self._read_state(db, client_id, tier, current_time)
+            self._refill(state, config, current_time)
+
+            if state.tokens >= cost:
+                state.tokens -= cost
+                state.denial_count = 0
+                await self._write_state(db, client_id, tier, state, staged=staged)
+                return RateLimitDecision(
+                    allowed=True,
+                    tokens_remaining=state.tokens,
+                    denial_count=0,
+                )
+
+            state.denial_count += 1
+            shortfall = cost - state.tokens
+            refill_wait = shortfall / config.refill_rate
+            retry_after = max(
+                refill_wait,
+                min(
+                    config.base_retry_after_seconds * (2 ** (state.denial_count - 1)),
+                    config.max_retry_after_seconds,
+                ),
+            )
+            await self._write_state(db, client_id, tier, state, staged=staged)
             return RateLimitDecision(
-                allowed=True,
-                tokens_remaining=state.tokens,
-                denial_count=0,
+                allowed=False,
+                tokens_remaining=max(state.tokens, 0.0),
+                retry_after_seconds=math.ceil(retry_after * 1000) / 1000,
+                denial_count=state.denial_count,
             )
 
-        state.denial_count += 1
-        shortfall = cost - state.tokens
-        refill_wait = shortfall / config.refill_rate
-        retry_after = max(
-            refill_wait,
-            min(
-                config.base_retry_after_seconds * (2 ** (state.denial_count - 1)),
-                config.max_retry_after_seconds,
-            ),
-        )
-        await self._write_state(client_id, tier, state)
-        return RateLimitDecision(
-            allowed=False,
-            tokens_remaining=max(state.tokens, 0.0),
-            retry_after_seconds=math.ceil(retry_after * 1000) / 1000,
-            denial_count=state.denial_count,
-        )
+        return await self._db.transaction(callback)
 
     async def _read_state(
         self,
+        db: DatabaseManager,
         client_id: str,
         tier: RateLimitTier,
         now: float,
     ) -> TokenBucketState:
         key = self._state_key(client_id, tier)
-        record = await self._db.get_system_state_record(key)
+        record = await db.get_system_state_record(key)
         config = self._config_for(tier)
         if record is None or record["value_text"] is None:
             return TokenBucketState(tokens=float(config.capacity), last_refill_epoch=now)
@@ -183,13 +188,17 @@ class TieredRateLimiter:
 
     async def _write_state(
         self,
+        db: DatabaseManager,
         client_id: str,
         tier: RateLimitTier,
         state: TokenBucketState,
+        *,
+        staged: dict[str, tuple[str | None, int | None]] | None = None,
     ) -> None:
-        await self._db.set_system_state(
+        await db.set_system_state(
             self._state_key(client_id, tier),
             value_text=state.to_json(),
+            staged=staged,
         )
 
     @staticmethod

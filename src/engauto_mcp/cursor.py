@@ -59,7 +59,10 @@ class HmacCursorCodec:
             raise CursorValidationError("Cursor payload is malformed.") from exc
 
         if instance_id != self._secrets.persistent_instance_id:
-            raise CursorValidationError("Cursor was issued by a different server instance.")
+            raise CursorValidationError(
+                "Cursor was issued by a different server instance.",
+                {"reason": "persistent_instance_id_mismatch"},
+            )
 
         return DecodedCursor(
             offset=int(offset_raw),
