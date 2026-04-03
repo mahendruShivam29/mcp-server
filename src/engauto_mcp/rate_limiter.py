@@ -141,7 +141,6 @@ class TieredRateLimiter:
 
         async def callback(
             db: DatabaseManager,
-            staged: dict[str, tuple[str | None, int | None]],
             on_commit: list[Any],
         ) -> RateLimitDecision:
             blacklist_retry = await self._resource_blacklist_retry_after(db, client_id, tier, current_time)
@@ -158,7 +157,7 @@ class TieredRateLimiter:
             if state.tokens >= cost:
                 state.tokens -= cost
                 state.denial_count = 0
-                await self._write_state(db, client_id, tier, state, staged=staged)
+                await self._write_state(db, client_id, tier, state)
                 return RateLimitDecision(
                     allowed=True,
                     tokens_remaining=state.tokens,
@@ -175,7 +174,7 @@ class TieredRateLimiter:
                     config.max_retry_after_seconds,
                 ),
             )
-            await self._write_state(db, client_id, tier, state, staged=staged)
+            await self._write_state(db, client_id, tier, state)
             return RateLimitDecision(
                 allowed=False,
                 tokens_remaining=max(state.tokens, 0.0),
@@ -190,7 +189,6 @@ class TieredRateLimiter:
 
         async def callback(
             db: DatabaseManager,
-            staged: dict[str, tuple[str | None, int | None]],
             on_commit: list[Any],
         ) -> None:
             history_key = f"hmac_failures:{client_id}"
@@ -199,12 +197,11 @@ class TieredRateLimiter:
             if record and record[0]:
                 timestamps = [ts for ts in json.loads(record[0]) if current_time - ts <= 60]
             timestamps.append(current_time)
-            await db.set_system_state(history_key, value_text=json.dumps(timestamps), staged=staged)
+            await db.set_system_state(history_key, value_text=json.dumps(timestamps))
             if len(timestamps) >= 3:
                 await db.set_system_state(
                     f"resource_blacklist_until:{client_id}",
                     value_integer=int(current_time + 300),
-                    staged=staged,
                 )
 
         await self._db.transaction(callback)
@@ -229,13 +226,10 @@ class TieredRateLimiter:
         client_id: str,
         tier: RateLimitTier,
         state: TokenBucketState,
-        *,
-        staged: dict[str, tuple[str | None, int | None]] | None = None,
     ) -> None:
         await db.set_system_state(
             self._state_key(client_id, tier),
             value_text=state.to_json(),
-            staged=staged,
         )
 
     @staticmethod

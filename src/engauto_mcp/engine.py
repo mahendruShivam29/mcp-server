@@ -53,10 +53,9 @@ class BackgroundDeploymentEngine:
 
     async def enqueue(self, task_id: str, environment: dict[str, Any]) -> None:
         await self._db.transaction(
-            lambda db, staged, on_commit: db.set_system_state(
+            lambda db, on_commit: db.set_system_state(
                 "DEPLOY_LOCK_INSTANCE_ID",
                 value_text=self._instance_id,
-                staged=staged,
             )
         )
         await self._queue.put((task_id, environment))
@@ -83,7 +82,6 @@ class BackgroundDeploymentEngine:
 
         async def callback(
             db: DatabaseManager,
-            staged: dict[str, tuple[str | None, int | None]],
             on_commit: list[Callable[[], Awaitable[None]]],
         ) -> None:
             task = await db.fetch_task(task_id)
@@ -95,8 +93,8 @@ class BackgroundDeploymentEngine:
                 "outcome": new_status,
             }
             document["status"] = new_status
-            await db.update_task_document(task, document, staged=staged)
-            await self._reset_lock_state(db, staged, on_commit)
+            await db.update_task_document(task, document)
+            await self._reset_lock_state(db, on_commit)
             self._subscriptions.emit_resource_updated("tasks://running", on_commit=on_commit)
             self._subscriptions.emit_resource_updated(f"tasks://{new_status}", on_commit=on_commit)
 
@@ -105,11 +103,10 @@ class BackgroundDeploymentEngine:
     async def _reset_lock_state(
         self,
         db: DatabaseManager,
-        staged: dict[str, tuple[str | None, int | None]],
         on_commit: list[Callable[[], Awaitable[None]]],
     ) -> None:
-        await db.set_system_state("DEPLOY_LOCK", value_text="IDLE", staged=staged)
-        await db.set_system_state("DEPLOY_LOCK_INSTANCE_ID", value_text="", staged=staged)
+        await db.set_system_state("DEPLOY_LOCK", value_text="IDLE")
+        await db.set_system_state("DEPLOY_LOCK_INSTANCE_ID", value_text="")
 
     def queue_metric(self, key: str, amount: int = 1) -> None:
         self._metric_queue.put_nowait((key, amount))
@@ -135,13 +132,12 @@ class BackgroundDeploymentEngine:
     async def _flush_metric_batch(self, batch: dict[str, int]) -> None:
         async def callback(
             db: DatabaseManager,
-            staged: dict[str, tuple[str | None, int | None]],
             on_commit: list[Callable[[], Awaitable[None]]],
         ) -> None:
             for key, amount in batch.items():
                 current = await db.get_system_state(key)
                 current_value = int(current[1] or 0) if current else 0
-                await db.set_system_state(key, value_integer=current_value + amount, staged=staged)
+                await db.set_system_state(key, value_integer=current_value + amount)
 
         await self._db.transaction(callback)
 
@@ -155,7 +151,6 @@ class BackgroundDeploymentEngine:
 
         async def callback(
             db: DatabaseManager,
-            staged: dict[str, tuple[str | None, int | None]],
             on_commit: list[Callable[[], Awaitable[None]]],
         ) -> None:
             running_tasks = await db.list_tasks(status="running", limit=1000)
@@ -163,8 +158,8 @@ class BackgroundDeploymentEngine:
                 document = json.loads(task.payload_json)
                 document["status"] = "failed"
                 document["recovery_reason"] = "Recovered interrupted deployment during startup."
-                await db.update_task_document(task, document, staged=staged)
-            await self._reset_lock_state(db, staged, on_commit)
+                await db.update_task_document(task, document)
+            await self._reset_lock_state(db, on_commit)
             if running_tasks:
                 self._subscriptions.emit_resource_updated("tasks://running", on_commit=on_commit)
                 self._subscriptions.emit_resource_updated("tasks://failed", on_commit=on_commit)

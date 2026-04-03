@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import asyncio
+from contextvars import ContextVar, copy_context
+import inspect
 import json
 import time
 from collections.abc import Awaitable, Callable
@@ -11,6 +14,7 @@ from .models import TaskRecord
 from .persistence import initialize_persistence
 
 StagedState = dict[str, tuple[str | None, int | None]]
+_staged_context: ContextVar[dict[str, Any] | None] = ContextVar("staged_context", default=None)
 CommitCallback = Callable[[], Awaitable[None]]
 
 
@@ -46,18 +50,20 @@ class DatabaseManager:
     async def transaction(
         self,
         callback: Callable[
-            ["DatabaseManager", StagedState, list[CommitCallback | DeferredOnCommitCallback]],
+            ["DatabaseManager", list[CommitCallback | DeferredOnCommitCallback]],
             Awaitable[Any],
         ],
     ) -> Any:
         self._ensure_connection()
         staged: StagedState = {}
+        token = _staged_context.set(staged)
         on_commit: list[CommitCallback | DeferredOnCommitCallback] = []
         try:
             await self._execute("BEGIN IMMEDIATE;")
-            result = await callback(self, staged, on_commit)
+            result = await self._run_in_context(callback, self, on_commit)
             await self._commit()
-            self._apply_staged_state(staged)
+            committed_staged = self._current_staged_state() or staged
+            self._apply_staged_state(committed_staged)
             immediate_callbacks = [
                 item for item in on_commit if not isinstance(item, DeferredOnCommitCallback)
             ]
@@ -72,6 +78,8 @@ class DatabaseManager:
         except Exception:
             await self._rollback()
             raise
+        finally:
+            _staged_context.reset(token)
 
     async def fetch_task(self, task_id: str) -> TaskRecord | None:
         row = await self._fetchone(
@@ -117,8 +125,6 @@ class DatabaseManager:
         self,
         task: TaskRecord,
         document: dict[str, Any],
-        *,
-        staged: StagedState | None = None,
     ) -> TaskRecord:
         now = _unix_timestamp()
         next_etag = task.etag + 1
@@ -157,7 +163,6 @@ class DatabaseManager:
         *,
         value_text: str | None = None,
         value_integer: int | None = None,
-        staged: StagedState | None = None,
     ) -> None:
         now = _unix_timestamp()
         await self._execute(
@@ -171,8 +176,8 @@ class DatabaseManager:
             """,
             (key, value_text, value_integer, now),
         )
-        self.stage_live_state(key, value_text=value_text, value_integer=value_integer, staged=staged)
-        if staged is None:
+        self.stage_live_state(key, value_text=value_text, value_integer=value_integer)
+        if self._current_staged_state() is None:
             await self._commit()
 
     async def get_system_state(self, key: str) -> tuple[str | None, int | None] | None:
@@ -198,9 +203,9 @@ class DatabaseManager:
         )
         return None if row is None else row["value_text"]
 
-    async def write_read_heartbeat(self, *, staged: StagedState | None = None) -> int:
+    async def write_read_heartbeat(self) -> int:
         now = _unix_timestamp()
-        await self.set_system_state("HEARTBEAT", value_integer=now, staged=staged)
+        await self.set_system_state("HEARTBEAT", value_integer=now)
         row = await self._fetchone("SELECT value_integer FROM system_state WHERE key = 'HEARTBEAT'")
         return int(row["value_integer"]) if row else now
 
@@ -243,8 +248,8 @@ class DatabaseManager:
         *,
         value_text: str | None = None,
         value_integer: int | None = None,
-        staged: StagedState | None = None,
     ) -> None:
+        staged = self._current_staged_state()
         if staged is None:
             self.live_state[key] = (value_text, value_integer)
             return
@@ -262,13 +267,19 @@ class DatabaseManager:
             return
         self.live_state.update(staged)
 
+    def _current_staged_state(self) -> StagedState | None:
+        staged = _staged_context.get()
+        if staged is None:
+            return None
+        return staged
+
     async def _execute(
         self,
         sql: str,
         parameters: tuple[Any, ...] = (),
     ) -> Any:
         self._ensure_connection()
-        return await self.connection.execute(sql, parameters)
+        return await self._run_in_context(self.connection.execute, sql, parameters)
 
     async def _fetchone(
         self,
@@ -276,7 +287,7 @@ class DatabaseManager:
         parameters: tuple[Any, ...] = (),
     ) -> Any:
         cursor = await self._execute(sql, parameters)
-        return await cursor.fetchone()
+        return await self._run_in_context(cursor.fetchone)
 
     async def _fetchall(
         self,
@@ -284,15 +295,23 @@ class DatabaseManager:
         parameters: tuple[Any, ...] = (),
     ) -> list[Any]:
         cursor = await self._execute(sql, parameters)
-        return await cursor.fetchall()
+        return await self._run_in_context(cursor.fetchall)
 
     async def _commit(self) -> None:
         self._ensure_connection()
-        await self.connection.commit()
+        await self._run_in_context(self.connection.commit)
 
     async def _rollback(self) -> None:
         self._ensure_connection()
-        await self.connection.rollback()
+        await self._run_in_context(self.connection.rollback)
+
+    async def _run_in_context(self, callback: Callable[..., Any], *args: Any) -> Any:
+        context = copy_context()
+        result = context.run(callback, *args)
+        if inspect.isawaitable(result):
+            task = context.run(asyncio.create_task, result)
+            return await task
+        return result
 
     def _ensure_connection(self) -> None:
         if self.connection is None:
