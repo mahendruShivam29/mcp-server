@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from pathlib import Path
+import secrets
 import sys
 
 from .compat import DEPENDENCY_AVAILABILITY
@@ -10,7 +11,7 @@ from .config import DEFAULT_DB_PATH, LLM_INSTRUCTIONS
 from .cursor import HmacCursorCodec
 from .db import DatabaseManager
 from .engine import BackgroundDeploymentEngine
-from .errors import JsonRpcError
+from .errors import CursorValidationError, JsonRpcError
 from .jsonrpc import JsonRpcPeer, StdIOTransport
 from .logging_utils import configure_logging
 from .models import SamplingRequest, SamplingResponse, TriggerDeploymentRequest
@@ -38,10 +39,12 @@ class EngineeringAutomationServer:
         self._tools: ToolService | None = None
         self._engine: BackgroundDeploymentEngine | None = None
         self._cursor_monitor_task: asyncio.Task[None] | None = None
+        self._instance_id = ""
 
     async def start(self) -> None:
         await self.db.open()
         secrets = load_cursor_secrets(self.database_path)
+        self._instance_id = secrets.persistent_instance_id
         self._engine = BackgroundDeploymentEngine(
             self.db,
             self._subscriptions,
@@ -98,6 +101,7 @@ class EngineeringAutomationServer:
             self.client_capabilities = dict(params.get("capabilities", {}))
             return {
                 "serverInfo": {"name": "engauto-mcp", "version": "0.1.0"},
+                "protocolVersion": "2024-11-05",
                 "instructions": LLM_INSTRUCTIONS,
                 "capabilities": {
                     "resources": {"subscribe": True},
@@ -116,7 +120,11 @@ class EngineeringAutomationServer:
         if method == "resources/read":
             await self.rate_limiter.consume(self.client_id, RateLimitTier.RESOURCE)
             assert self._resources is not None
-            page = await self._resources.read_resource(str(params["uri"]))
+            try:
+                page = await self._resources.read_resource(str(params["uri"]))
+            except CursorValidationError:
+                await self.rate_limiter.record_hmac_failure(self.client_id)
+                raise
             return page.model_dump()
         if method == "resources/subscribe":
             uri = str(params["uri"])
@@ -155,7 +163,13 @@ class EngineeringAutomationServer:
             raise JsonRpcError(-32020, "Peer is not ready for sampling.")
         if "sampling" not in self.client_capabilities:
             raise JsonRpcError(-32004, "Client does not advertise sampling capability.")
-        result = await self.peer.send_request("sampling/createMessage", request.model_dump(), timeout=30.0)
+        request_id = f"srv-{self._instance_id}-{secrets.token_hex(8)}-sampling"
+        result = await self.peer.send_request(
+            "sampling/createMessage",
+            request.model_dump(),
+            timeout=30.0,
+            request_id=request_id,
+        )
         return SamplingResponse.model_validate(result)
 
     async def _emit_to_clients(

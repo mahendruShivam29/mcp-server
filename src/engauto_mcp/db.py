@@ -5,6 +5,7 @@ import json
 import time
 import asyncio
 from collections.abc import Awaitable, Callable
+from contextvars import copy_context
 from pathlib import Path
 from typing import Any
 
@@ -43,23 +44,29 @@ class DatabaseManager:
 
     async def transaction(
         self,
-        callback: Callable[["DatabaseManager", StagedState], Awaitable[Any]],
+        callback: Callable[
+            ["DatabaseManager", StagedState, list[Callable[[], Awaitable[None]]]],
+            Awaitable[Any],
+        ],
     ) -> Any:
         self._ensure_connection()
         staged: StagedState = {}
+        on_commit: list[Callable[[], Awaitable[None]]] = []
         token = _staged_live_state.set(staged)
         task = asyncio.current_task()
         task_id = id(task) if task is not None else None
         if task_id is not None:
             self._task_staging[task_id] = staged
         try:
-            await self._execute("BEGIN IMMEDIATE;")
-            result = await callback(self, staged)
-            await self._commit()
+            await self._execute("BEGIN IMMEDIATE;", staged=staged)
+            result = await callback(self, staged, on_commit)
+            await self._commit(staged=staged)
             self._apply_staged_state(staged)
+            for callback in on_commit:
+                await callback()
             return result
         except Exception:
-            await self._rollback()
+            await self._rollback(staged=staged)
             raise
         finally:
             if task_id is not None:
@@ -102,26 +109,28 @@ class DatabaseManager:
         now = _unix_timestamp()
         next_etag = task.etag + 1
         payload_json = json.dumps(document, sort_keys=True)
+        next_status = document.get("status", task.status)
+        next_title = document.get("title", task.title)
         await self._execute(
             """
             UPDATE tasks
-            SET title = ?, status = ?, etag = ?, payload_json = ?, updated_at = ?
+            SET title = ?, status = ?, etag = etag + 1, payload_json = ?, updated_at = ?
             WHERE id = ?
             """,
             (
-                document.get("title", task.title),
-                document.get("status", task.status),
-                next_etag,
+                next_title,
+                next_status,
                 payload_json,
                 now,
                 task.id,
             ),
+            staged=staged,
         )
         return TaskRecord.model_validate(
             {
                 "id": task.id,
-                "title": document.get("title", task.title),
-                "status": document.get("status", task.status),
+                "title": next_title,
+                "status": next_status,
                 "etag": next_etag,
                 "payload_json": payload_json,
                 "created_at": task.created_at,
@@ -148,6 +157,7 @@ class DatabaseManager:
                 updated_at = excluded.updated_at
             """,
             (key, value_text, value_integer, now),
+            staged=staged,
         )
         self.stage_live_state(key, value_text=value_text, value_integer=value_integer, staged=staged)
         if staged is None and self._active_staging() is None:
@@ -180,13 +190,22 @@ class DatabaseManager:
         now = _unix_timestamp()
         await self.set_system_state("HEARTBEAT", value_integer=now, staged=staged)
         row = await self._fetchone(
-            "SELECT value_integer FROM system_state WHERE key = 'HEARTBEAT'"
+            "SELECT value_integer FROM system_state WHERE key = 'HEARTBEAT'",
+            staged=staged,
         )
         return int(row["value_integer"]) if row else now
 
     async def sqlite_version(self) -> str:
         row = await self._fetchone("SELECT sqlite_version() AS version")
         return str(row["version"])
+
+    async def integrity_check(self) -> str:
+        row = await self._fetchone("PRAGMA integrity_check;")
+        return str(row[0]) if row is not None else "unknown"
+
+    async def foreign_key_check(self) -> list[dict[str, Any]]:
+        rows = await self._fetchall("PRAGMA foreign_key_check;")
+        return [dict(row) for row in rows]
 
     async def checkpoint_wal(self) -> None:
         await self._execute("PRAGMA wal_checkpoint(PASSIVE);")
@@ -231,29 +250,81 @@ class DatabaseManager:
                 return staged
         return _staged_live_state.get()
 
-    async def _execute(self, sql: str, parameters: tuple[Any, ...] = ()) -> Any:
+    async def _execute(
+        self,
+        sql: str,
+        parameters: tuple[Any, ...] = (),
+        *,
+        staged: StagedState | None = None,
+    ) -> Any:
         self._ensure_connection()
-        staged = self._active_staging()
-        cursor = await self.connection.execute(sql, parameters)
-        if staged is not None:
-            _staged_live_state.set(staged)
-        return cursor
+        active_staged = staged if staged is not None else self._active_staging()
+        context = copy_context()
 
-    async def _fetchone(self, sql: str, parameters: tuple[Any, ...] = ()) -> Any:
-        cursor = await self._execute(sql, parameters)
-        return await cursor.fetchone()
+        def invoke() -> Any:
+            if active_staged is None:
+                return self.connection.execute(sql, parameters)
+            token = _staged_live_state.set(active_staged)
+            try:
+                return self.connection.execute(sql, parameters)
+            finally:
+                _staged_live_state.reset(token)
 
-    async def _fetchall(self, sql: str, parameters: tuple[Any, ...] = ()) -> list[Any]:
-        cursor = await self._execute(sql, parameters)
-        return await cursor.fetchall()
+        return await context.run(invoke)
 
-    async def _commit(self) -> None:
+    async def _fetchone(
+        self,
+        sql: str,
+        parameters: tuple[Any, ...] = (),
+        *,
+        staged: StagedState | None = None,
+    ) -> Any:
+        cursor = await self._execute(sql, parameters, staged=staged)
+        context = copy_context()
+        return await context.run(cursor.fetchone)
+
+    async def _fetchall(
+        self,
+        sql: str,
+        parameters: tuple[Any, ...] = (),
+        *,
+        staged: StagedState | None = None,
+    ) -> list[Any]:
+        cursor = await self._execute(sql, parameters, staged=staged)
+        context = copy_context()
+        return await context.run(cursor.fetchall)
+
+    async def _commit(self, *, staged: StagedState | None = None) -> None:
         self._ensure_connection()
-        await self.connection.commit()
+        active_staged = staged if staged is not None else self._active_staging()
+        context = copy_context()
 
-    async def _rollback(self) -> None:
+        def invoke() -> Any:
+            if active_staged is None:
+                return self.connection.commit()
+            token = _staged_live_state.set(active_staged)
+            try:
+                return self.connection.commit()
+            finally:
+                _staged_live_state.reset(token)
+
+        await context.run(invoke)
+
+    async def _rollback(self, *, staged: StagedState | None = None) -> None:
         self._ensure_connection()
-        await self.connection.rollback()
+        active_staged = staged if staged is not None else self._active_staging()
+        context = copy_context()
+
+        def invoke() -> Any:
+            if active_staged is None:
+                return self.connection.rollback()
+            token = _staged_live_state.set(active_staged)
+            try:
+                return self.connection.rollback()
+            finally:
+                _staged_live_state.reset(token)
+
+        await context.run(invoke)
 
     def _ensure_connection(self) -> None:
         if self.connection is None:

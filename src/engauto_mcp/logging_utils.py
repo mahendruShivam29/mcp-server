@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sys
 from typing import Any
 
@@ -11,6 +12,11 @@ LOGGER_NAME = "engauto_mcp"
 
 
 class RedactingJsonFormatter(logging.Formatter):
+    _deep_scrub_patterns = (
+        re.compile(r'("persistent_instance_id"\s*:\s*")([^"]+)(")', re.IGNORECASE),
+        re.compile(r'((?:cursor_secret|CURSOR_SECRET)[A-Za-z0-9_]*["\'=: ]+)([A-Za-z0-9_\-+/=]+)'),
+    )
+
     def format(self, record: logging.LogRecord) -> str:
         payload = {
             "level": record.levelname,
@@ -19,7 +25,8 @@ class RedactingJsonFormatter(logging.Formatter):
         }
         if record.args:
             payload["args"] = self._redact(record.args)
-        return json.dumps(payload, default=str)
+        formatted = json.dumps(payload, default=str)
+        return self._deep_scrub(formatted)
 
     def _redact(self, value: Any) -> Any:
         if isinstance(value, SecretStr):
@@ -31,6 +38,12 @@ class RedactingJsonFormatter(logging.Formatter):
         if hasattr(value, "get_secret_value") and value.__class__.__name__ == "SecretStr":
             return "**********"
         return value
+
+    def _deep_scrub(self, formatted: str) -> str:
+        scrubbed = formatted
+        scrubbed = self._deep_scrub_patterns[0].sub(r'\1**********\3', scrubbed)
+        scrubbed = self._deep_scrub_patterns[1].sub(r'\1**********', scrubbed)
+        return scrubbed
 
 
 def configure_logging(level: int = logging.INFO) -> logging.Logger:

@@ -31,6 +31,7 @@ class BackgroundDeploymentEngine:
         self._logger = configure_logging()
 
     async def start(self) -> None:
+        await self._recover_interrupted_work()
         if self._task is None:
             self._task = asyncio.create_task(self._worker())
         if self._metric_task is None:
@@ -52,7 +53,7 @@ class BackgroundDeploymentEngine:
 
     async def enqueue(self, task_id: str, environment: dict[str, Any]) -> None:
         await self._db.transaction(
-            lambda db, staged: db.set_system_state(
+            lambda db, staged, on_commit: db.set_system_state(
                 "DEPLOY_LOCK_INSTANCE_ID",
                 value_text=self._instance_id,
                 staged=staged,
@@ -80,7 +81,11 @@ class BackgroundDeploymentEngine:
     async def _complete_task(self, task_id: str, environment: dict[str, Any]) -> None:
         new_status = "failed" if environment.get("target") == "fail" else "completed"
 
-        async def callback(db: DatabaseManager, staged: dict[str, tuple[str | None, int | None]]) -> None:
+        async def callback(
+            db: DatabaseManager,
+            staged: dict[str, tuple[str | None, int | None]],
+            on_commit: list[Callable[[], Awaitable[None]]],
+        ) -> None:
             task = await db.fetch_task(task_id)
             if task is None:
                 return
@@ -91,16 +96,17 @@ class BackgroundDeploymentEngine:
             }
             document["status"] = new_status
             await db.update_task_document(task, document, staged=staged)
-            await self._reset_lock_state(db, staged)
+            await self._reset_lock_state(db, staged, on_commit)
+            self._subscriptions.emit_resource_updated("tasks://running", on_commit=on_commit)
+            self._subscriptions.emit_resource_updated(f"tasks://{new_status}", on_commit=on_commit)
 
         await self._db.transaction(callback)
-        self._subscriptions.emit_resource_updated("tasks://running")
-        self._subscriptions.emit_resource_updated(f"tasks://{new_status}")
 
     async def _reset_lock_state(
         self,
         db: DatabaseManager,
         staged: dict[str, tuple[str | None, int | None]],
+        on_commit: list[Callable[[], Awaitable[None]]],
     ) -> None:
         await db.set_system_state("DEPLOY_LOCK", value_text="IDLE", staged=staged)
         await db.set_system_state("DEPLOY_LOCK_INSTANCE_ID", value_text="", staged=staged)
@@ -130,10 +136,37 @@ class BackgroundDeploymentEngine:
         async def callback(
             db: DatabaseManager,
             staged: dict[str, tuple[str | None, int | None]],
+            on_commit: list[Callable[[], Awaitable[None]]],
         ) -> None:
             for key, amount in batch.items():
                 current = await db.get_system_state(key)
                 current_value = int(current[1] or 0) if current else 0
                 await db.set_system_state(key, value_integer=current_value + amount, staged=staged)
+
+        await self._db.transaction(callback)
+
+    async def _recover_interrupted_work(self) -> None:
+        lock_state = await self._db.get_system_state("DEPLOY_LOCK")
+        lock_owner = await self._db.get_system_state("DEPLOY_LOCK_INSTANCE_ID")
+        if (lock_state[0] if lock_state else None) != "RUNNING":
+            return
+        if (lock_owner[0] if lock_owner else None) != self._instance_id:
+            return
+
+        async def callback(
+            db: DatabaseManager,
+            staged: dict[str, tuple[str | None, int | None]],
+            on_commit: list[Callable[[], Awaitable[None]]],
+        ) -> None:
+            running_tasks = await db.list_tasks(status="running", limit=1000, offset=0)
+            for task in running_tasks:
+                document = json.loads(task.payload_json)
+                document["status"] = "failed"
+                document["recovery_reason"] = "Recovered interrupted deployment during startup."
+                await db.update_task_document(task, document, staged=staged)
+            await self._reset_lock_state(db, staged, on_commit)
+            if running_tasks:
+                self._subscriptions.emit_resource_updated("tasks://running", on_commit=on_commit)
+                self._subscriptions.emit_resource_updated("tasks://failed", on_commit=on_commit)
 
         await self._db.transaction(callback)

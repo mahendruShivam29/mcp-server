@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import hashlib
 import hmac
 import time
@@ -18,7 +19,10 @@ def _b64url_encode(raw: bytes) -> str:
 
 def _b64url_decode(encoded: str) -> bytes:
     padding = "=" * (-len(encoded) % 4)
-    return base64.urlsafe_b64decode(encoded + padding)
+    try:
+        return base64.urlsafe_b64decode(encoded + padding)
+    except (binascii.Error, ValueError) as exc:
+        raise CursorValidationError("Cursor payload is malformed.") from exc
 
 
 @dataclass(frozen=True, slots=True)

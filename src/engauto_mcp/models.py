@@ -61,6 +61,8 @@ class EngineHealth(BaseModel):
 
     sqlite_version: str
     persistent_instance_id: str
+    integrity_check_result: str
+    foreign_key_check_results: list[dict[str, Any]]
     wal_file_size_bytes: int
     active_subscriptions_count: int
     heartbeat_timestamp: int

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import time
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from .compat import jsonpatch, require_dependency
@@ -82,9 +83,10 @@ class ToolService:
         for _ in range(2):
             try:
                 result = await self._db.transaction(
-                    lambda db, staged: self._apply_deployment_patch(
+                    lambda db, staged, on_commit: self._apply_deployment_patch(
                         db,
                         staged,
+                        on_commit,
                         request.task_id,
                         patch_ops,
                         request.environment,
@@ -112,7 +114,9 @@ class ToolService:
         raise JsonRpcError(-32005, "Deployment remediation attempts exhausted.")
 
     async def get_engine_health(self) -> EngineHealth:
-        heartbeat = await self._db.transaction(lambda db, staged: db.write_read_heartbeat(staged=staged))
+        heartbeat = await self._db.transaction(
+            lambda db, staged, on_commit: db.write_read_heartbeat(staged=staged)
+        )
         wal_path = self._db.database_path.with_name(self._db.database_path.name + "-wal")
         wal_size = wal_path.stat().st_size if wal_path.exists() else 0
         persistent_instance_id = await self._db.get_metadata_text("persistent_instance_id")
@@ -122,6 +126,8 @@ class ToolService:
         return EngineHealth(
             sqlite_version=await self._db.sqlite_version(),
             persistent_instance_id=persistent_instance_id or "",
+            integrity_check_result=await self._db.integrity_check(),
+            foreign_key_check_results=await self._db.foreign_key_check(),
             wal_file_size_bytes=wal_size,
             active_subscriptions_count=self._subscriptions.active_subscriptions_count(),
             heartbeat_timestamp=heartbeat,
@@ -133,6 +139,7 @@ class ToolService:
         self,
         db: DatabaseManager,
         staged: dict[str, tuple[str | None, int | None]],
+        on_commit: list[Callable[[], Awaitable[None]]],
         task_id: str,
         patch_ops: list[dict[str, Any]],
         environment: dict[str, Any],
@@ -158,8 +165,8 @@ class ToolService:
         updated_document["deployment_environment"] = environment
         updated_task = await db.update_task_document(task, updated_document, staged=staged)
         await db.set_system_state("DEPLOY_LOCK", value_text="RUNNING", staged=staged)
-        self._subscriptions.emit_resource_updated(f"tasks://{task.status}")
-        self._subscriptions.emit_resource_updated(f"tasks://{updated_task.status}")
+        self._subscriptions.emit_resource_updated(f"tasks://{task.status}", on_commit=on_commit)
+        self._subscriptions.emit_resource_updated(f"tasks://{updated_task.status}", on_commit=on_commit)
         return {
             "task_id": updated_task.id,
             "status": updated_task.status,

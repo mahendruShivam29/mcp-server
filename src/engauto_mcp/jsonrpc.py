@@ -59,9 +59,9 @@ class JsonRpcPeer:
         self._request_handler = request_handler
         self._notification_handler = notification_handler
         self._next_id = 1
-        self._pending: dict[int, asyncio.Future[dict[str, Any]]] = {}
-        self._expired_ids: deque[int] = deque(maxlen=1000)
-        self._expired_id_lookup: set[int] = set()
+        self._pending: dict[int | str, asyncio.Future[dict[str, Any]]] = {}
+        self._expired_ids: deque[int | str] = deque(maxlen=1000)
+        self._expired_id_lookup: set[int | str] = set()
 
     async def serve_forever(self) -> None:
         while True:
@@ -69,7 +69,7 @@ class JsonRpcPeer:
             if message is None:
                 return
             if "id" in message and ("result" in message or "error" in message):
-                response_id = int(message["id"])
+                response_id = message["id"]
                 if response_id in self._expired_id_lookup:
                     self._expired_id_lookup.discard(response_id)
                     continue
@@ -87,9 +87,11 @@ class JsonRpcPeer:
         method: str,
         params: dict[str, Any],
         timeout: float = 30.0,
+        request_id: int | str | None = None,
     ) -> dict[str, Any]:
-        request_id = self._next_id
-        self._next_id += 1
+        if request_id is None:
+            request_id = self._next_id
+            self._next_id += 1
         future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
         self._pending[request_id] = future
         await self._write_message(

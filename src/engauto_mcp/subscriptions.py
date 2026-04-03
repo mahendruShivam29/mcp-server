@@ -6,6 +6,7 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 NotificationEmitter = Callable[[str, dict[str, Any], set[str]], Awaitable[None]]
+OnCommitCallback = Callable[[], Awaitable[None]]
 
 
 class SubscriptionManager:
@@ -31,7 +32,21 @@ class SubscriptionManager:
     def active_subscriptions_count(self) -> int:
         return sum(len(uris) for uris in self._subscriptions.values())
 
-    def emit_resource_updated(self, uri: str) -> None:
+    def emit_resource_updated(
+        self,
+        uri: str,
+        *,
+        on_commit: list[OnCommitCallback] | None = None,
+    ) -> None:
+        if on_commit is not None:
+            on_commit.append(lambda: self._schedule_emit(uri))
+            return
+        self._schedule_emit_now(uri)
+
+    async def _schedule_emit(self, uri: str) -> None:
+        self._schedule_emit_now(uri)
+
+    def _schedule_emit_now(self, uri: str) -> None:
         existing = self._debounce_tasks.get(uri)
         if existing is not None and not existing.done():
             existing.cancel()

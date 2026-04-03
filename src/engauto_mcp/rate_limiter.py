@@ -6,6 +6,7 @@ import math
 import time
 from dataclasses import dataclass
 from enum import Enum
+from typing import Any
 
 from .db import DatabaseManager
 
@@ -138,7 +139,19 @@ class TieredRateLimiter:
         current_time = time.time() if now is None else now
         config = self._config_for(tier)
 
-        async def callback(db: DatabaseManager, staged: dict[str, tuple[str | None, int | None]]) -> RateLimitDecision:
+        async def callback(
+            db: DatabaseManager,
+            staged: dict[str, tuple[str | None, int | None]],
+            on_commit: list[Any],
+        ) -> RateLimitDecision:
+            blacklist_retry = await self._resource_blacklist_retry_after(db, client_id, tier, current_time)
+            if blacklist_retry is not None:
+                return RateLimitDecision(
+                    allowed=False,
+                    tokens_remaining=0.0,
+                    retry_after_seconds=blacklist_retry,
+                    denial_count=0,
+                )
             state = await self._read_state(db, client_id, tier, current_time)
             self._refill(state, config, current_time)
 
@@ -171,6 +184,30 @@ class TieredRateLimiter:
             )
 
         return await self._db.transaction(callback)
+
+    async def record_hmac_failure(self, client_id: str, *, now: float | None = None) -> None:
+        current_time = time.time() if now is None else now
+
+        async def callback(
+            db: DatabaseManager,
+            staged: dict[str, tuple[str | None, int | None]],
+            on_commit: list[Any],
+        ) -> None:
+            history_key = f"hmac_failures:{client_id}"
+            record = await db.get_system_state(history_key)
+            timestamps = []
+            if record and record[0]:
+                timestamps = [ts for ts in json.loads(record[0]) if current_time - ts <= 60]
+            timestamps.append(current_time)
+            await db.set_system_state(history_key, value_text=json.dumps(timestamps), staged=staged)
+            if len(timestamps) >= 3:
+                await db.set_system_state(
+                    f"resource_blacklist_until:{client_id}",
+                    value_integer=int(current_time + 300),
+                    staged=staged,
+                )
+
+        await self._db.transaction(callback)
 
     async def _read_state(
         self,
@@ -210,6 +247,21 @@ class TieredRateLimiter:
     @staticmethod
     def _state_key(client_id: str, tier: RateLimitTier) -> str:
         return f"rate_limit:{tier.value}:{client_id}"
+
+    async def _resource_blacklist_retry_after(
+        self,
+        db: DatabaseManager,
+        client_id: str,
+        tier: RateLimitTier,
+        now: float,
+    ) -> float | None:
+        if tier is not RateLimitTier.RESOURCE:
+            return None
+        record = await db.get_system_state(f"resource_blacklist_until:{client_id}")
+        if record is None or record[1] is None:
+            return None
+        retry_after = int(record[1]) - now
+        return math.ceil(max(retry_after, 0.0) * 1000) / 1000 if retry_after > 0 else None
 
     def _config_for(self, tier: RateLimitTier) -> TokenBucketConfig:
         if tier is RateLimitTier.RESOURCE:
