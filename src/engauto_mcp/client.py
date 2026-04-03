@@ -8,7 +8,7 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from .errors import JsonRpcError
-from .jsonrpc import JsonRpcPeer, encode_message, read_message_async
+from .jsonrpc import JsonRpcPeer, StdIOTransport, encode_message, read_message_async
 from .models import SamplingRequest, SamplingResponse
 
 SamplingHandler = Callable[[SamplingRequest], Awaitable[SamplingResponse]]
@@ -33,13 +33,30 @@ class SubprocessTransport:
             await self._process.stdin.drain()
 
 
+class ClientStdIOTransport:
+    def __init__(self) -> None:
+        self._transport = StdIOTransport()
+
+    async def read_message(self) -> dict[str, Any] | None:
+        return await self._transport.read_message()
+
+    async def write_message(self, payload: dict[str, Any]) -> None:
+        await self._transport.write_message(payload)
+
+
 class MCPClient:
     def __init__(
         self,
-        process: asyncio.subprocess.Process,
+        process: asyncio.subprocess.Process | None = None,
         sampling_handler: SamplingHandler | None = None,
+        transport: Any | None = None,
     ) -> None:
-        self._transport = SubprocessTransport(process)
+        if transport is not None:
+            self._transport = transport
+        elif process is not None:
+            self._transport = SubprocessTransport(process)
+        else:
+            raise ValueError("Either a subprocess or transport must be provided.")
         self._sampling_handler = sampling_handler or self._default_sampling_handler
         self._peer = JsonRpcPeer(
             self._transport.read_message,
@@ -84,12 +101,17 @@ class MCPClient:
             print(json.dumps({"log": params}, ensure_ascii=True), file=sys.stderr)
 
     async def _default_sampling_handler(self, request: SamplingRequest) -> SamplingResponse:
-        patch = [{"op": "test", "path": "/status", "value": request.current_status}]
+        patch = None
         if request.original_error:
+            patch = [{"op": "test", "path": "/status", "value": request.current_status}]
             actual = request.original_error.get("data", {}).get("actual", {})
             if "etag" in actual:
                 patch.append({"op": "test", "path": "/etag", "value": actual["etag"]})
         return SamplingResponse(approved=True, patch=patch, message="Auto-approved remediation")
+
+    async def run_stdio_forever(self) -> None:
+        self._reader_task = asyncio.create_task(self._peer.serve_forever())
+        await self._reader_task
 
 
 async def _spawn_server(command: list[str]) -> asyncio.subprocess.Process:
@@ -102,6 +124,11 @@ async def _spawn_server(command: list[str]) -> asyncio.subprocess.Process:
 
 
 async def _run_cli(args: argparse.Namespace) -> int:
+    if args.command == "stdio-proxy":
+        client = MCPClient(transport=ClientStdIOTransport())
+        await client.run_stdio_forever()
+        return 0
+
     process = await _spawn_server(args.server_command)
     client = MCPClient(process)
     await client.start()
@@ -114,7 +141,16 @@ async def _run_cli(args: argparse.Namespace) -> int:
             print(json.dumps(await client.read_resource(args.uri), indent=2))
         elif args.command == "tool-call":
             arguments = json.loads(args.arguments) if args.arguments else {}
-            print(json.dumps(await client.call_tool(args.name, arguments), indent=2))
+            while True:
+                try:
+                    print(json.dumps(await client.call_tool(args.name, arguments), indent=2))
+                    break
+                except JsonRpcError as error:
+                    if error.code == -32002:
+                        retry_after = float((error.data or {}).get("retry_after", 0))
+                        await asyncio.sleep(retry_after)
+                        continue
+                    raise
         return 0
     finally:
         await client.stop()
@@ -138,6 +174,7 @@ def build_parser() -> argparse.ArgumentParser:
     tool_call = subparsers.add_parser("tool-call")
     tool_call.add_argument("name")
     tool_call.add_argument("--arguments", default="{}")
+    subparsers.add_parser("stdio-proxy")
     return parser
 
 

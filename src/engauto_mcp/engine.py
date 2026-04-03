@@ -40,9 +40,7 @@ class BackgroundDeploymentEngine:
         owner_state = await self._db.get_system_state("DEPLOY_LOCK_OWNER")
         owner = owner_state[0] if owner_state else None
         if owner == self._instance_id:
-            await self._db.transaction(
-                lambda db: db.set_system_state("DEPLOY_LOCK", value_text="IDLE")
-            )
+            await self._db.transaction(self._reset_lock_state)
 
     async def enqueue(self, task_id: str, environment: dict[str, Any]) -> None:
         await self._db.transaction(
@@ -67,6 +65,8 @@ class BackgroundDeploymentEngine:
                 self._queue.task_done()
 
     async def _complete_task(self, task_id: str, environment: dict[str, Any]) -> None:
+        new_status = "failed" if environment.get("target") == "fail" else "completed"
+
         async def callback(db: DatabaseManager) -> None:
             task = await db.fetch_task(task_id)
             if task is None:
@@ -74,13 +74,16 @@ class BackgroundDeploymentEngine:
             document = json.loads(task.payload_json)
             document["deployment_result"] = {
                 "environment": environment,
-                "outcome": "failed" if environment.get("target") == "fail" else "completed",
+                "outcome": new_status,
             }
-            document["status"] = "failed" if environment.get("target") == "fail" else "completed"
+            document["status"] = new_status
             await db.update_task_document(task, document)
-            await db.set_system_state("DEPLOY_LOCK", value_text="IDLE")
+            await self._reset_lock_state(db)
 
         await self._db.transaction(callback)
         self._subscriptions.emit_resource_updated("tasks://running")
-        self._subscriptions.emit_resource_updated("tasks://completed")
-        self._subscriptions.emit_resource_updated("tasks://failed")
+        self._subscriptions.emit_resource_updated(f"tasks://{new_status}")
+
+    async def _reset_lock_state(self, db: DatabaseManager) -> None:
+        await db.set_system_state("DEPLOY_LOCK", value_text="IDLE")
+        await db.set_system_state("DEPLOY_LOCK_OWNER", value_text="")

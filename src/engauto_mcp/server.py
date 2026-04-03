@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from .compat import DEPENDENCY_AVAILABILITY
-from .config import DEFAULT_DB_PATH
+from .config import DEFAULT_DB_PATH, LLM_INSTRUCTIONS
 from .cursor import HmacCursorCodec
 from .db import DatabaseManager
 from .engine import BackgroundDeploymentEngine
@@ -81,6 +81,7 @@ class EngineeringAutomationServer:
         if method == "initialize":
             return {
                 "serverInfo": {"name": "engauto-mcp", "version": "0.1.0"},
+                "instructions": LLM_INSTRUCTIONS,
                 "capabilities": {
                     "resources": {"subscribe": True},
                     "tools": {},

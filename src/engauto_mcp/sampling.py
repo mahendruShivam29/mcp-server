@@ -18,7 +18,23 @@ class SamplingGuard:
         self._sampler = sampler
         self._max_remediation_attempts = max_remediation_attempts
 
-    async def request(self, request: SamplingRequest, original_error: JsonRpcError) -> SamplingResponse:
+    async def request_preflight(
+        self,
+        request: SamplingRequest,
+        original_error: JsonRpcError,
+    ) -> SamplingResponse:
+        if self._sampler is None:
+            raise original_error
+        try:
+            return await self._sampler(request)
+        except JsonRpcError:
+            raise original_error
+
+    async def request_remediation(
+        self,
+        request: SamplingRequest,
+        original_error: JsonRpcError,
+    ) -> SamplingResponse:
         attempts = _remediation_attempts.get()
         if attempts >= self._max_remediation_attempts:
             raise original_error

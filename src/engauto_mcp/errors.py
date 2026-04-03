@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from .rate_limiter import RateLimitExceeded
+
 
 @dataclass(frozen=True, slots=True)
 class JsonRpcError(Exception):
@@ -36,3 +38,20 @@ class TOCTOUConflictError(JsonRpcError):
                 "actual": actual,
             },
         )
+
+
+def map_exception_to_jsonrpc(exc: Exception) -> JsonRpcError:
+    if isinstance(exc, JsonRpcError):
+        return exc
+    if isinstance(exc, RateLimitExceeded):
+        payload = exc.as_payload()
+        return JsonRpcError(
+            code=int(payload["code"]),
+            message="Rate limit exceeded.",
+            data={
+                "tier": payload["tier"],
+                "retry_after": payload["retry_after"],
+                "denial_count": payload["denial_count"],
+            },
+        )
+    return JsonRpcError(-32603, str(exc))

@@ -35,6 +35,7 @@ class SamplingRequest(BaseModel):
     environment: dict[str, Any]
     diff: dict[str, Any]
     original_error: dict[str, Any] | None = None
+    prompt_instructions: str | None = None
 
 
 class SamplingResponse(BaseModel):

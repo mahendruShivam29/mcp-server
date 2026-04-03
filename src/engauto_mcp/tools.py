@@ -4,6 +4,7 @@ import json
 from typing import Any
 
 from .compat import jsonpatch, require_dependency
+from .config import LLM_INSTRUCTIONS
 from .db import DatabaseManager
 from .errors import JsonRpcError, TOCTOUConflictError
 from .models import EngineHealth, SamplingRequest, TriggerDeploymentRequest
@@ -44,14 +45,29 @@ class ToolService:
     async def trigger_deployment(self, request: TriggerDeploymentRequest) -> dict[str, Any]:
         self._rate_limiter.consume(request.client_id, RateLimitTier.TOOL)
         patch_ops = list(request.patch)
+        current_task = await self._db.fetch_task(request.task_id)
+        if current_task is None:
+            raise JsonRpcError(-32010, f"Task '{request.task_id}' was not found.")
+        current_document = {
+            "id": current_task.id,
+            "title": current_task.title,
+            "status": current_task.status,
+            "etag": current_task.etag,
+            **json.loads(current_task.payload_json),
+        }
+        current_environment = current_document.get("deployment_environment", {})
 
-        approval = await self._sampling_guard.request(
+        approval = await self._sampling_guard.request_preflight(
             SamplingRequest(
                 reason=request.reason,
                 task_id=request.task_id,
-                current_status="unknown",
+                current_status=current_task.status,
                 environment=request.environment,
-                diff=request.environment,
+                diff={
+                    "before": current_environment,
+                    "after": request.environment,
+                },
+                prompt_instructions=LLM_INSTRUCTIONS,
             ),
             JsonRpcError(-32004, "Sampling approval is required before deployment."),
         )
@@ -60,7 +76,7 @@ class ToolService:
         if approval.patch:
             patch_ops = approval.patch
 
-        for _ in range(3):
+        for _ in range(2):
             try:
                 result = await self._db.transaction(
                     lambda db: self._apply_deployment_patch(db, request.task_id, patch_ops, request.environment)
@@ -68,7 +84,7 @@ class ToolService:
                 await self._enqueue_deployment(result["task_id"], request.environment)
                 return result
             except TOCTOUConflictError as error:
-                remediation = await self._sampling_guard.request(
+                remediation = await self._sampling_guard.request_remediation(
                     SamplingRequest(
                         reason="TOCTOU remediation required",
                         task_id=request.task_id,
@@ -76,6 +92,7 @@ class ToolService:
                         environment=request.environment,
                         diff={"expected": error.data["expected"], "actual": error.data["actual"]},
                         original_error=error.to_payload(),
+                        prompt_instructions=LLM_INSTRUCTIONS,
                     ),
                     error,
                 )
@@ -124,6 +141,7 @@ class ToolService:
         updated_document["deployment_environment"] = environment
         updated_task = await db.update_task_document(task, updated_document)
         await db.set_system_state("DEPLOY_LOCK", value_text="RUNNING")
+        self._subscriptions.emit_resource_updated(f"tasks://{task.status}")
         self._subscriptions.emit_resource_updated(f"tasks://{updated_task.status}")
         return {
             "task_id": updated_task.id,

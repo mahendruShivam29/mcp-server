@@ -6,7 +6,7 @@ import sys
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-from .errors import JsonRpcError
+from .errors import JsonRpcError, map_exception_to_jsonrpc
 
 
 def encode_message(payload: dict[str, Any]) -> bytes:
@@ -116,14 +116,12 @@ class JsonRpcPeer:
                 }
             )
         except Exception as exc:
+            error = map_exception_to_jsonrpc(exc)
             await self._write_message(
                 {
                     "jsonrpc": "2.0",
                     "id": message["id"],
-                    "error": {
-                        "code": -32603,
-                        "message": str(exc),
-                    },
+                    "error": error.to_payload(),
                 }
             )
 
