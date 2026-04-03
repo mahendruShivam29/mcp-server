@@ -48,6 +48,10 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         updated_at INTEGER NOT NULL
     ) STRICT
     """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_tasks_status_updated_at
+    ON tasks(status, updated_at DESC, id)
+    """,
 )
 
 
@@ -73,6 +77,7 @@ def initialize_persistence(database_path: str | Path) -> CursorSecrets:
         for statement in SCHEMA_STATEMENTS:
             connection.execute(statement)
         secrets_state = _ensure_security_foundation(connection)
+        _ensure_system_seed_data(connection)
         connection.commit()
         return secrets_state
 
@@ -114,6 +119,34 @@ def _ensure_security_foundation(connection: sqlite3.Connection) -> CursorSecrets
         persistent_instance_id=instance_id,
         current_secret=current_secret,
         previous_secret=previous_secret,
+    )
+
+
+def _ensure_system_seed_data(connection: sqlite3.Connection) -> None:
+    now = _unix_timestamp()
+    connection.execute(
+        """
+        INSERT INTO system_state (key, value_text, value_integer, updated_at)
+        VALUES ('DEPLOY_LOCK', 'IDLE', NULL, ?)
+        ON CONFLICT(key) DO NOTHING
+        """,
+        (now,),
+    )
+    connection.execute(
+        """
+        INSERT INTO system_state (key, value_text, value_integer, updated_at)
+        VALUES ('DEPLOY_LOCK_OWNER', '', NULL, ?)
+        ON CONFLICT(key) DO NOTHING
+        """,
+        (now,),
+    )
+    connection.execute(
+        """
+        INSERT INTO tasks (id, title, status, etag, payload_json, created_at, updated_at)
+        VALUES ('task-demo', 'Demo Deployment Task', 'pending', 1, '{}', ?, ?)
+        ON CONFLICT(id) DO NOTHING
+        """,
+        (now, now),
     )
 
 
