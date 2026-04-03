@@ -3,9 +3,12 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import sys
 from collections.abc import Awaitable, Callable
 from typing import Any
+
+import google.generativeai as genai
 
 from .errors import JsonRpcError
 from .jsonrpc import JsonRpcPeer, StdIOTransport, encode_message, read_message_async
@@ -103,6 +106,9 @@ class MCPClient:
 
     async def read_resource(self, uri: str) -> dict[str, Any]:
         return await self._peer.send_request("resources/read", {"uri": uri})
+
+    async def list_tools(self) -> dict[str, Any]:
+        return await self._peer.send_request("tools/list", {})
 
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         return await self._peer.send_request("tools/call", {"name": name, "arguments": arguments})
@@ -215,11 +221,91 @@ async def _run_cli(args: argparse.Namespace) -> int:
         elif args.command == "tool-call":
             arguments = json.loads(args.arguments) if args.arguments else {}
             print(json.dumps(await client.call_tool_with_policy(args.name, arguments), indent=2))
+        elif args.command == "ask":
+            tool_call = await _plan_tool_call_with_gemini(client, args.query)
+            print(
+                json.dumps(
+                    await client.call_tool_with_policy(tool_call["name"], tool_call["arguments"]),
+                    indent=2,
+                )
+            )
         return 0
     finally:
         await client.stop()
         process.terminate()
         await process.wait()
+
+
+async def _plan_tool_call_with_gemini(
+    client: MCPClient,
+    query: str,
+) -> dict[str, Any]:
+    api_key = os.environ.get("GOOGLE_API_KEY")
+    if not api_key:
+        print("GOOGLE_API_KEY is not set. The ask command requires Gemini access.", file=sys.stderr)
+        raise SystemExit(2)
+
+    genai.configure(api_key=api_key)
+    model = genai.GenerativeModel("gemini-1.5-flash")
+    tools_response = await client.list_tools()
+    resources_response = await client.list_resources()
+    prompt = _build_gemini_prompt(
+        query=query,
+        tools=tools_response.get("tools", []),
+        resources=resources_response.get("resources", []),
+    )
+
+    try:
+        response = await asyncio.to_thread(
+            model.generate_content,
+            prompt,
+            generation_config={
+                "response_mime_type": "application/json",
+            },
+        )
+        raw_text = getattr(response, "text", "") or ""
+        tool_call = json.loads(raw_text)
+    except Exception as exc:
+        print(f"Gemini failed to produce a valid tool call: {exc}", file=sys.stderr)
+        raise SystemExit(2) from exc
+
+    if not isinstance(tool_call, dict):
+        print("Gemini returned a non-object response for the tool call.", file=sys.stderr)
+        raise SystemExit(2)
+    name = tool_call.get("name")
+    arguments = tool_call.get("arguments")
+    if not isinstance(name, str) or not isinstance(arguments, dict):
+        print(
+            "Gemini did not return valid tool JSON. Expected {\"name\": \"tool_name\", \"arguments\": {...}}.",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+    return {"name": name, "arguments": arguments}
+
+
+def _build_gemini_prompt(
+    *,
+    query: str,
+    tools: list[dict[str, Any]],
+    resources: list[dict[str, Any]],
+) -> str:
+    return (
+        "You are a planner for a minimal MCP client.\n"
+        "Choose exactly one MCP tool call that best satisfies the user request.\n"
+        "You must output strictly valid JSON only, with no markdown and no explanation.\n"
+        'Use this exact format: {"name": "tool_name", "arguments": {...}}.\n'
+        "Available tools:\n"
+        f"{json.dumps(tools, indent=2, ensure_ascii=True)}\n"
+        "Available resources:\n"
+        f"{json.dumps(resources, indent=2, ensure_ascii=True)}\n"
+        "Safety requirements:\n"
+        "- If the user mentions deploy, deployment, or releasing, use the trigger_deployment tool.\n"
+        "- For trigger_deployment, ensure arguments include reason and environment.\n"
+        "- Use only tool names that exist in the available tools list.\n"
+        "- Return one tool call only.\n"
+        "User instruction:\n"
+        f"{query}\n"
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -238,6 +324,8 @@ def build_parser() -> argparse.ArgumentParser:
     tool_call = subparsers.add_parser("tool-call")
     tool_call.add_argument("name")
     tool_call.add_argument("--arguments", default="{}")
+    ask = subparsers.add_parser("ask")
+    ask.add_argument("query")
     subparsers.add_parser("stdio-proxy")
     return parser
 
