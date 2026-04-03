@@ -67,6 +67,8 @@ def connect_bootstrap_database(database_path: str | Path) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(path)
     connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA busy_timeout = 5000;")
+    connection.execute("PRAGMA foreign_keys = ON;")
     return connection
 
 
@@ -135,7 +137,7 @@ def _ensure_system_seed_data(connection: sqlite3.Connection) -> None:
     connection.execute(
         """
         INSERT INTO system_state (key, value_text, value_integer, updated_at)
-        VALUES ('DEPLOY_LOCK_OWNER', '', NULL, ?)
+        VALUES ('DEPLOY_LOCK_INSTANCE_ID', '', NULL, ?)
         ON CONFLICT(key) DO NOTHING
         """,
         (now,),

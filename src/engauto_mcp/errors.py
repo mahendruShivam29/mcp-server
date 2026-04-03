@@ -28,7 +28,13 @@ class CursorValidationError(JsonRpcError):
 
 
 class TOCTOUConflictError(JsonRpcError):
-    def __init__(self, task_id: str, expected: dict[str, Any], actual: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        task_id: str,
+        expected: dict[str, Any],
+        actual: dict[str, Any],
+        resource_uri: str | None = None,
+    ) -> None:
         super().__init__(
             -32003,
             "Task state changed during deployment trigger.",
@@ -36,6 +42,7 @@ class TOCTOUConflictError(JsonRpcError):
                 "task_id": task_id,
                 "expected": expected,
                 "actual": actual,
+                "resource_uri": resource_uri,
             },
         )
 

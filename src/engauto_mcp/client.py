@@ -88,6 +88,23 @@ class MCPClient:
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         return await self._peer.send_request("tools/call", {"name": name, "arguments": arguments})
 
+    async def call_tool_with_policy(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        mutable_arguments = json.loads(json.dumps(arguments))
+        while True:
+            try:
+                return await self.call_tool(name, mutable_arguments)
+            except JsonRpcError as error:
+                if error.code == -32002:
+                    retry_after = float((error.data or {}).get("retry_after", 0))
+                    await asyncio.sleep(retry_after)
+                    continue
+                if error.code == -32003 and await self._repair_patch_from_resource(
+                    mutable_arguments,
+                    error.data,
+                ):
+                    continue
+                raise
+
     async def _handle_request(self, message: dict[str, Any]) -> dict[str, Any]:
         if message["method"] == "sampling/createMessage":
             request = SamplingRequest.model_validate(message.get("params", {}))
@@ -108,6 +125,43 @@ class MCPClient:
             if "etag" in actual:
                 patch.append({"op": "test", "path": "/etag", "value": actual["etag"]})
         return SamplingResponse(approved=True, patch=patch, message="Auto-approved remediation")
+
+    async def _repair_patch_from_resource(
+        self,
+        arguments: dict[str, Any],
+        error_data: dict[str, Any] | None,
+    ) -> bool:
+        if not error_data:
+            return False
+        resource_uri = error_data.get("resource_uri")
+        patch = arguments.get("patch")
+        if not resource_uri or not isinstance(patch, list):
+            return False
+
+        resource = await self.read_resource(resource_uri)
+        items = resource.get("items", [])
+        task_id = arguments.get("task_id")
+        actual = None
+        for item in items:
+            if item.get("id") == task_id:
+                actual = item
+                break
+        if actual is None:
+            actual = error_data.get("actual", {})
+
+        repaired = False
+        for op in patch:
+            if op.get("op") != "test":
+                continue
+            if op.get("path") == "/status" and "status" in actual:
+                op["value"] = actual["status"]
+                repaired = True
+            if op.get("path") == "/etag" and "etag" in actual:
+                op["value"] = actual["etag"]
+                repaired = True
+        if repaired:
+            arguments["_last_reread_resource_uri"] = resource_uri
+        return repaired
 
     async def run_stdio_forever(self) -> None:
         self._reader_task = asyncio.create_task(self._peer.serve_forever())
@@ -141,16 +195,7 @@ async def _run_cli(args: argparse.Namespace) -> int:
             print(json.dumps(await client.read_resource(args.uri), indent=2))
         elif args.command == "tool-call":
             arguments = json.loads(args.arguments) if args.arguments else {}
-            while True:
-                try:
-                    print(json.dumps(await client.call_tool(args.name, arguments), indent=2))
-                    break
-                except JsonRpcError as error:
-                    if error.code == -32002:
-                        retry_after = float((error.data or {}).get("retry_after", 0))
-                        await asyncio.sleep(retry_after)
-                        continue
-                    raise
+            print(json.dumps(await client.call_tool_with_policy(args.name, arguments), indent=2))
         return 0
     finally:
         await client.stop()

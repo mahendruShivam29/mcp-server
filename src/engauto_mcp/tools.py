@@ -168,6 +168,6 @@ class ToolService:
         expected = {"status": test_status, "etag": test_etag}
         actual = {"status": current_document.get("status"), "etag": current_document.get("etag")}
         if test_status is None or test_etag is None:
-            raise TOCTOUConflictError(task_id, expected, actual)
+            raise TOCTOUConflictError(task_id, expected, actual, f"tasks://{actual['status']}")
         if test_status != actual["status"] or test_etag != actual["etag"]:
-            raise TOCTOUConflictError(task_id, expected, actual)
+            raise TOCTOUConflictError(task_id, expected, actual, f"tasks://{actual['status']}")

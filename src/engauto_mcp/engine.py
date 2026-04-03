@@ -37,14 +37,14 @@ class BackgroundDeploymentEngine:
             self._task.cancel()
             await asyncio.gather(self._task, return_exceptions=True)
             self._task = None
-        owner_state = await self._db.get_system_state("DEPLOY_LOCK_OWNER")
-        owner = owner_state[0] if owner_state else None
-        if owner == self._instance_id:
+        stored_instance_state = await self._db.get_system_state("DEPLOY_LOCK_INSTANCE_ID")
+        stored_instance_id = stored_instance_state[0] if stored_instance_state else None
+        if stored_instance_id == self._instance_id:
             await self._db.transaction(self._reset_lock_state)
 
     async def enqueue(self, task_id: str, environment: dict[str, Any]) -> None:
         await self._db.transaction(
-            lambda db: db.set_system_state("DEPLOY_LOCK_OWNER", value_text=self._instance_id)
+            lambda db: db.set_system_state("DEPLOY_LOCK_INSTANCE_ID", value_text=self._instance_id)
         )
         await self._queue.put((task_id, environment))
 
@@ -86,4 +86,4 @@ class BackgroundDeploymentEngine:
 
     async def _reset_lock_state(self, db: DatabaseManager) -> None:
         await db.set_system_state("DEPLOY_LOCK", value_text="IDLE")
-        await db.set_system_state("DEPLOY_LOCK_OWNER", value_text="")
+        await db.set_system_state("DEPLOY_LOCK_INSTANCE_ID", value_text="")
