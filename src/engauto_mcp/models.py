@@ -60,6 +60,7 @@ class EngineHealth(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     sqlite_version: str
+    persistent_instance_id: str
     wal_file_size_bytes: int
     active_subscriptions_count: int
     heartbeat_timestamp: int

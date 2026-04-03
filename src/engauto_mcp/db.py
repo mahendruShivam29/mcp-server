@@ -5,7 +5,6 @@ import json
 import time
 import asyncio
 from collections.abc import Awaitable, Callable
-from contextvars import copy_context
 from pathlib import Path
 from typing import Any
 
@@ -163,6 +162,13 @@ class DatabaseManager:
         )
         return None if row is None else dict(row)
 
+    async def get_metadata_text(self, key: str) -> str | None:
+        row = await self._fetchone(
+            "SELECT value_text FROM system_metadata WHERE key = ?",
+            (key,),
+        )
+        return None if row is None else row["value_text"]
+
     async def write_read_heartbeat(self) -> int:
         now = _unix_timestamp()
         await self.set_system_state("HEARTBEAT", value_integer=now)
@@ -176,6 +182,9 @@ class DatabaseManager:
         return str(row["version"])
 
     async def checkpoint_wal(self) -> None:
+        await self._execute("PRAGMA wal_checkpoint(PASSIVE);")
+
+    async def maintenance_checkpoint(self) -> None:
         await self._execute("PRAGMA wal_checkpoint(RESTART);")
 
     def stage_live_state(
@@ -213,31 +222,27 @@ class DatabaseManager:
 
     async def _execute(self, sql: str, parameters: tuple[Any, ...] = ()) -> Any:
         self._ensure_connection()
-        # Touch staging before the aiosqlite thread handoff so task-local state remains visible.
-        self._active_staging()
-        context = copy_context()
-        cursor = await context.run(self.connection.execute, sql, parameters)
+        staged = self._active_staging()
+        cursor = await self.connection.execute(sql, parameters)
+        if staged is not None:
+            _staged_live_state.set(staged)
         return cursor
 
     async def _fetchone(self, sql: str, parameters: tuple[Any, ...] = ()) -> Any:
         cursor = await self._execute(sql, parameters)
-        context = copy_context()
-        return await context.run(cursor.fetchone)
+        return await cursor.fetchone()
 
     async def _fetchall(self, sql: str, parameters: tuple[Any, ...] = ()) -> list[Any]:
         cursor = await self._execute(sql, parameters)
-        context = copy_context()
-        return await context.run(cursor.fetchall)
+        return await cursor.fetchall()
 
     async def _commit(self) -> None:
         self._ensure_connection()
-        context = copy_context()
-        await context.run(self.connection.commit)
+        await self.connection.commit()
 
     async def _rollback(self) -> None:
         self._ensure_connection()
-        context = copy_context()
-        await context.run(self.connection.rollback)
+        await self.connection.rollback()
 
     def _ensure_connection(self) -> None:
         if self.connection is None:

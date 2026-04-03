@@ -85,11 +85,14 @@ class TaskResourceService:
         self._cursor_codec = cursor_codec
 
     async def _record_cursor_metric(self, *, total: int, failures: int) -> None:
-        if total:
-            total_state = await self._db.get_system_state("cursor_decode_total")
-            current_total = int(total_state[1] or 0) if total_state else 0
-            await self._db.set_system_state("cursor_decode_total", value_integer=current_total + total)
-        if failures:
-            failure_state = await self._db.get_system_state("cursor_decode_failures")
-            current_failures = int(failure_state[1] or 0) if failure_state else 0
-            await self._db.set_system_state("cursor_decode_failures", value_integer=current_failures + failures)
+        async def callback(db: DatabaseManager) -> None:
+            if total:
+                total_state = await db.get_system_state("cursor_decode_total")
+                current_total = int(total_state[1] or 0) if total_state else 0
+                await db.set_system_state("cursor_decode_total", value_integer=current_total + total)
+            if failures:
+                failure_state = await db.get_system_state("cursor_decode_failures")
+                current_failures = int(failure_state[1] or 0) if failure_state else 0
+                await db.set_system_state("cursor_decode_failures", value_integer=current_failures + failures)
+
+        await self._db.transaction(callback)

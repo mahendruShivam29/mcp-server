@@ -68,7 +68,10 @@ class MCPClient:
 
     async def start(self) -> None:
         self._reader_task = asyncio.create_task(self._peer.serve_forever())
-        await self._peer.send_request("initialize", {})
+        await self._peer.send_request(
+            "initialize",
+            {"capabilities": {"sampling": {}}},
+        )
         await self._peer.send_notification("notifications/initialized", {})
 
     async def stop(self) -> None:

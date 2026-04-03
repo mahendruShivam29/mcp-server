@@ -51,7 +51,7 @@ class BackgroundDeploymentEngine:
     async def maintenance_checkpoint(self) -> None:
         await self._log_emitter("WARN", "WAL checkpoint will start in 1 second.")
         await asyncio.sleep(1)
-        await self._db.checkpoint_wal()
+        await self._db.maintenance_checkpoint()
 
     async def _worker(self) -> None:
         while True:

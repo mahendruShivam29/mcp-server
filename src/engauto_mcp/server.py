@@ -31,6 +31,7 @@ class EngineeringAutomationServer:
         self.rate_limiter = TieredRateLimiter(self.db)
         self.peer: JsonRpcPeer | None = None
         self.client_id = "stdio-client"
+        self.client_capabilities: dict[str, object] = {}
         self._subscriptions = SubscriptionManager(self._emit_to_clients)
         self._sampling_guard = SamplingGuard(self._sample_client)
         self._resources: TaskResourceService | None = None
@@ -90,6 +91,7 @@ class EngineeringAutomationServer:
         params = dict(message.get("params", {}))
 
         if method == "initialize":
+            self.client_capabilities = dict(params.get("capabilities", {}))
             return {
                 "serverInfo": {"name": "engauto-mcp", "version": "0.1.0"},
                 "instructions": LLM_INSTRUCTIONS,
@@ -147,6 +149,8 @@ class EngineeringAutomationServer:
     async def _sample_client(self, request: SamplingRequest) -> SamplingResponse:
         if self.peer is None:
             raise JsonRpcError(-32020, "Peer is not ready for sampling.")
+        if not self.client_capabilities.get("sampling"):
+            raise JsonRpcError(-32004, "Client does not advertise sampling capability.")
         result = await self.peer.send_request("sampling/createMessage", request.model_dump(), timeout=30.0)
         return SamplingResponse.model_validate(result)
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 import json
 import sys
 from collections.abc import Awaitable, Callable
@@ -59,7 +60,8 @@ class JsonRpcPeer:
         self._notification_handler = notification_handler
         self._next_id = 1
         self._pending: dict[int, asyncio.Future[dict[str, Any]]] = {}
-        self._expired_ids: set[int] = set()
+        self._expired_ids: deque[int] = deque(maxlen=1000)
+        self._expired_id_lookup: set[int] = set()
 
     async def serve_forever(self) -> None:
         while True:
@@ -68,8 +70,8 @@ class JsonRpcPeer:
                 return
             if "id" in message and ("result" in message or "error" in message):
                 response_id = int(message["id"])
-                if response_id in self._expired_ids:
-                    self._expired_ids.discard(response_id)
+                if response_id in self._expired_id_lookup:
+                    self._expired_id_lookup.discard(response_id)
                     continue
                 future = self._pending.pop(response_id, None)
                 if future and not future.done():
@@ -102,7 +104,11 @@ class JsonRpcPeer:
             response = await asyncio.wait_for(future, timeout=timeout)
         except asyncio.TimeoutError as exc:
             self._pending.pop(request_id, None)
-            self._expired_ids.add(request_id)
+            if len(self._expired_ids) == self._expired_ids.maxlen:
+                expired = self._expired_ids.popleft()
+                self._expired_id_lookup.discard(expired)
+            self._expired_ids.append(request_id)
+            self._expired_id_lookup.add(request_id)
             raise JsonRpcError(
                 -32022,
                 f"Request timed out waiting for '{method}'.",

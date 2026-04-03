@@ -109,11 +109,13 @@ class ToolService:
         heartbeat = await self._db.transaction(lambda db: db.write_read_heartbeat())
         wal_path = self._db.database_path.with_name(self._db.database_path.name + "-wal")
         wal_size = wal_path.stat().st_size if wal_path.exists() else 0
+        persistent_instance_id = await self._db.get_metadata_text("persistent_instance_id")
         warning = None
         if wal_size > 100 * 1024 * 1024:
             warning = "WAL file exceeds 100MB."
         return EngineHealth(
             sqlite_version=await self._db.sqlite_version(),
+            persistent_instance_id=persistent_instance_id or "",
             wal_file_size_bytes=wal_size,
             active_subscriptions_count=self._subscriptions.active_subscriptions_count(),
             heartbeat_timestamp=heartbeat,
