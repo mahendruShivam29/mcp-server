@@ -59,6 +59,7 @@ class JsonRpcPeer:
         self._notification_handler = notification_handler
         self._next_id = 1
         self._pending: dict[int, asyncio.Future[dict[str, Any]]] = {}
+        self._expired_ids: set[int] = set()
 
     async def serve_forever(self) -> None:
         while True:
@@ -66,7 +67,11 @@ class JsonRpcPeer:
             if message is None:
                 return
             if "id" in message and ("result" in message or "error" in message):
-                future = self._pending.pop(int(message["id"]), None)
+                response_id = int(message["id"])
+                if response_id in self._expired_ids:
+                    self._expired_ids.discard(response_id)
+                    continue
+                future = self._pending.pop(response_id, None)
                 if future and not future.done():
                     future.set_result(message)
                 continue
@@ -75,7 +80,12 @@ class JsonRpcPeer:
             else:
                 await self._notification_handler(message)
 
-    async def send_request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+    async def send_request(
+        self,
+        method: str,
+        params: dict[str, Any],
+        timeout: float = 30.0,
+    ) -> dict[str, Any]:
         request_id = self._next_id
         self._next_id += 1
         future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
@@ -88,7 +98,16 @@ class JsonRpcPeer:
                 "params": params,
             }
         )
-        response = await future
+        try:
+            response = await asyncio.wait_for(future, timeout=timeout)
+        except asyncio.TimeoutError as exc:
+            self._pending.pop(request_id, None)
+            self._expired_ids.add(request_id)
+            raise JsonRpcError(
+                -32022,
+                f"Request timed out waiting for '{method}'.",
+                {"method": method, "timeout": timeout},
+            ) from exc
         if "error" in response:
             error = response["error"]
             raise JsonRpcError(error["code"], error["message"], error.get("data"))
@@ -129,6 +148,7 @@ class JsonRpcPeer:
 class StdIOTransport:
     def __init__(self) -> None:
         self._stdout_lock = asyncio.Lock()
+        self._stdout_buffer = sys.stdout.buffer
 
     async def read_message(self) -> dict[str, Any] | None:
         return await asyncio.to_thread(read_message_sync, sys.stdin.buffer)
@@ -136,9 +156,9 @@ class StdIOTransport:
     async def write_message(self, payload: dict[str, Any]) -> None:
         frame = encode_message(payload)
         async with self._stdout_lock:
-            await asyncio.to_thread(self._write_sync, frame)
+            await asyncio.to_thread(self._write_sync, self._stdout_buffer, frame)
 
     @staticmethod
-    def _write_sync(frame: bytes) -> None:
-        sys.stdout.buffer.write(frame)
-        sys.stdout.buffer.flush()
+    def _write_sync(buffer: Any, frame: bytes) -> None:
+        buffer.write(frame)
+        buffer.flush()

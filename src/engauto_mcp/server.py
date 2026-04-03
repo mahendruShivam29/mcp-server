@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import asyncio
+import contextlib
 from pathlib import Path
+import sys
 
 from .compat import DEPENDENCY_AVAILABILITY
 from .config import DEFAULT_DB_PATH, LLM_INSTRUCTIONS
@@ -11,7 +14,7 @@ from .errors import JsonRpcError
 from .jsonrpc import JsonRpcPeer, StdIOTransport
 from .logging_utils import configure_logging
 from .models import SamplingRequest, SamplingResponse, TriggerDeploymentRequest
-from .persistence import load_cursor_secrets
+from .persistence import load_cursor_secrets, rotate_cursor_secret
 from .rate_limiter import RateLimitTier, TieredRateLimiter
 from .resources import TaskResourceService
 from .sampling import SamplingGuard
@@ -25,7 +28,7 @@ class EngineeringAutomationServer:
         self.logger = configure_logging()
         self.transport = StdIOTransport()
         self.db = DatabaseManager(self.database_path)
-        self.rate_limiter = TieredRateLimiter()
+        self.rate_limiter = TieredRateLimiter(self.db)
         self.peer: JsonRpcPeer | None = None
         self.client_id = "stdio-client"
         self._subscriptions = SubscriptionManager(self._emit_to_clients)
@@ -33,6 +36,7 @@ class EngineeringAutomationServer:
         self._resources: TaskResourceService | None = None
         self._tools: ToolService | None = None
         self._engine: BackgroundDeploymentEngine | None = None
+        self._cursor_monitor_task: asyncio.Task[None] | None = None
 
     async def start(self) -> None:
         await self.db.open()
@@ -52,6 +56,7 @@ class EngineeringAutomationServer:
             self._sampling_guard,
             self._engine.enqueue,
             DEPENDENCY_AVAILABILITY,
+            self._emit_log_message,
         )
         self.peer = JsonRpcPeer(
             self.transport.read_message,
@@ -59,8 +64,13 @@ class EngineeringAutomationServer:
             self._handle_request,
             self._handle_notification,
         )
+        self._cursor_monitor_task = asyncio.create_task(self._monitor_cursor_failures())
 
     async def stop(self) -> None:
+        if self._cursor_monitor_task is not None:
+            self._cursor_monitor_task.cancel()
+            await asyncio.gather(self._cursor_monitor_task, return_exceptions=True)
+            self._cursor_monitor_task = None
         if self._engine is not None:
             await self._engine.stop()
         await self._subscriptions.close()
@@ -70,7 +80,8 @@ class EngineeringAutomationServer:
         await self.start()
         try:
             assert self.peer is not None
-            await self.peer.serve_forever()
+            with contextlib.redirect_stdout(sys.stderr):
+                await self.peer.serve_forever()
         finally:
             await self.stop()
 
@@ -89,15 +100,15 @@ class EngineeringAutomationServer:
                 },
             }
         if method == "resources/list":
-            self.rate_limiter.consume(self.client_id, RateLimitTier.RESOURCE)
+            await self.rate_limiter.consume(self.client_id, RateLimitTier.RESOURCE)
             assert self._resources is not None
             return {"resources": await self._resources.list_resources()}
         if method == "resources/templates/list":
-            self.rate_limiter.consume(self.client_id, RateLimitTier.RESOURCE)
+            await self.rate_limiter.consume(self.client_id, RateLimitTier.RESOURCE)
             assert self._resources is not None
             return {"resourceTemplates": self._resources.list_templates()}
         if method == "resources/read":
-            self.rate_limiter.consume(self.client_id, RateLimitTier.RESOURCE)
+            await self.rate_limiter.consume(self.client_id, RateLimitTier.RESOURCE)
             assert self._resources is not None
             page = await self._resources.read_resource(str(params["uri"]))
             return page.model_dump()
@@ -136,7 +147,7 @@ class EngineeringAutomationServer:
     async def _sample_client(self, request: SamplingRequest) -> SamplingResponse:
         if self.peer is None:
             raise JsonRpcError(-32020, "Peer is not ready for sampling.")
-        result = await self.peer.send_request("sampling/createMessage", request.model_dump())
+        result = await self.peer.send_request("sampling/createMessage", request.model_dump(), timeout=30.0)
         return SamplingResponse.model_validate(result)
 
     async def _emit_to_clients(
@@ -155,3 +166,20 @@ class EngineeringAutomationServer:
                 "notifications/logging/message",
                 {"level": level, "data": message},
             )
+
+    async def _monitor_cursor_failures(self) -> None:
+        while True:
+            await asyncio.sleep(5)
+            total_state = await self.db.get_system_state("cursor_decode_total")
+            failure_state = await self.db.get_system_state("cursor_decode_failures")
+            total = int(total_state[1] or 0) if total_state else 0
+            failures = int(failure_state[1] or 0) if failure_state else 0
+            if total == 0:
+                continue
+            if failures / total > 0.05:
+                secrets = rotate_cursor_secret(self.database_path)
+                if self._resources is not None:
+                    self._resources.refresh_cursor_codec(HmacCursorCodec(secrets))
+                await self.db.set_system_state("cursor_decode_total", value_integer=0)
+                await self.db.set_system_state("cursor_decode_failures", value_integer=0)
+                await self._emit_log_message("WARN", "Cursor secret rotated after elevated HMAC failures.")

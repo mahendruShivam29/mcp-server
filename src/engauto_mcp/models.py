@@ -64,3 +64,4 @@ class EngineHealth(BaseModel):
     active_subscriptions_count: int
     heartbeat_timestamp: int
     dependency_availability: dict[str, bool]
+    warning: str | None = None

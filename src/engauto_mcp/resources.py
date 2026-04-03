@@ -5,6 +5,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlencode, urlparse
 
 from .cursor import HmacCursorCodec
+from .errors import CursorValidationError
 from .db import DatabaseManager
 from .models import ResourcePage
 
@@ -46,7 +47,12 @@ class TaskResourceService:
         offset = 0
         migration_hint = False
         if cursor:
-            decoded = self._cursor_codec.decode(cursor)
+            await self._record_cursor_metric(total=1, failures=0)
+            try:
+                decoded = self._cursor_codec.decode(cursor)
+            except CursorValidationError:
+                await self._record_cursor_metric(total=0, failures=1)
+                raise
             offset = decoded.offset
             migration_hint = decoded.migration_hint
 
@@ -74,3 +80,16 @@ class TaskResourceService:
             next_cursor=next_cursor,
             migration_hint=migration_hint,
         )
+
+    def refresh_cursor_codec(self, cursor_codec: HmacCursorCodec) -> None:
+        self._cursor_codec = cursor_codec
+
+    async def _record_cursor_metric(self, *, total: int, failures: int) -> None:
+        if total:
+            total_state = await self._db.get_system_state("cursor_decode_total")
+            current_total = int(total_state[1] or 0) if total_state else 0
+            await self._db.set_system_state("cursor_decode_total", value_integer=current_total + total)
+        if failures:
+            failure_state = await self._db.get_system_state("cursor_decode_failures")
+            current_failures = int(failure_state[1] or 0) if failure_state else 0
+            await self._db.set_system_state("cursor_decode_failures", value_integer=current_failures + failures)

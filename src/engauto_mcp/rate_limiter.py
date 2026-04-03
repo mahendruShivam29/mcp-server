@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import asyncio
+import json
 import math
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
-from threading import Lock
+
+from .db import DatabaseManager
 
 
 class RateLimitTier(str, Enum):
@@ -27,8 +30,27 @@ class TokenBucketConfig:
 @dataclass(slots=True)
 class TokenBucketState:
     tokens: float
-    last_refill_monotonic: float
+    last_refill_epoch: float
     denial_count: int = 0
+
+    def to_json(self) -> str:
+        return json.dumps(
+            {
+                "tokens": self.tokens,
+                "last_refill_epoch": self.last_refill_epoch,
+                "denial_count": self.denial_count,
+            },
+            sort_keys=True,
+        )
+
+    @classmethod
+    def from_json(cls, raw: str, *, default_tokens: float, now: float) -> "TokenBucketState":
+        data = json.loads(raw)
+        return cls(
+            tokens=float(data.get("tokens", default_tokens)),
+            last_refill_epoch=float(data.get("last_refill_epoch", now)),
+            denial_count=int(data.get("denial_count", 0)),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,33 +76,22 @@ class RateLimitExceeded(Exception):
         }
 
 
-@dataclass(slots=True)
 class TieredRateLimiter:
-    resource_config: TokenBucketConfig = field(
-        default_factory=lambda: TokenBucketConfig(
+    def __init__(self, db: DatabaseManager) -> None:
+        self._db = db
+        self.resource_config = TokenBucketConfig(
             capacity=20,
             refill_window_seconds=10.0,
             base_retry_after_seconds=0.5,
         )
-    )
-    tool_config: TokenBucketConfig = field(
-        default_factory=lambda: TokenBucketConfig(
+        self.tool_config = TokenBucketConfig(
             capacity=5,
             refill_window_seconds=10.0,
             base_retry_after_seconds=1.0,
         )
-    )
-    _lock: Lock = field(init=False, repr=False)
-    _buckets: dict[tuple[str, RateLimitTier], TokenBucketState] = field(
-        init=False,
-        repr=False,
-    )
+        self._lock = asyncio.Lock()
 
-    def __post_init__(self) -> None:
-        self._lock = Lock()
-        self._buckets: dict[tuple[str, RateLimitTier], TokenBucketState] = {}
-
-    def consume(
+    async def consume(
         self,
         client_id: str,
         tier: RateLimitTier,
@@ -88,35 +99,35 @@ class TieredRateLimiter:
         cost: int = 1,
         now: float | None = None,
     ) -> RateLimitDecision:
-        with self._lock:
-            decision = self._consume_locked(client_id, tier, cost=cost, now=now)
-            if not decision.allowed and decision.retry_after_seconds is not None:
-                raise RateLimitExceeded(
-                    tier=tier,
-                    retry_after_seconds=decision.retry_after_seconds,
-                    denial_count=decision.denial_count,
-                )
-            return decision
+        async with self._lock:
+            decision = await self._consume_locked(client_id, tier, cost=cost, now=now)
+        if not decision.allowed and decision.retry_after_seconds is not None:
+            raise RateLimitExceeded(
+                tier=tier,
+                retry_after_seconds=decision.retry_after_seconds,
+                denial_count=decision.denial_count,
+            )
+        return decision
 
-    def inspect(
+    async def inspect(
         self,
         client_id: str,
         tier: RateLimitTier,
         *,
         now: float | None = None,
     ) -> RateLimitDecision:
-        with self._lock:
-            current_time = time.monotonic() if now is None else now
-            bucket = self._get_bucket(client_id, tier, current_time)
+        async with self._lock:
+            current_time = time.time() if now is None else now
+            state = await self._read_state(client_id, tier, current_time)
             config = self._config_for(tier)
-            self._refill(bucket, config, current_time)
+            self._refill(state, config, current_time)
             return RateLimitDecision(
                 allowed=True,
-                tokens_remaining=bucket.tokens,
-                denial_count=bucket.denial_count,
+                tokens_remaining=state.tokens,
+                denial_count=state.denial_count,
             )
 
-    def _consume_locked(
+    async def _consume_locked(
         self,
         client_id: str,
         tier: RateLimitTier,
@@ -124,59 +135,72 @@ class TieredRateLimiter:
         cost: int,
         now: float | None,
     ) -> RateLimitDecision:
-        current_time = time.monotonic() if now is None else now
-        bucket = self._get_bucket(client_id, tier, current_time)
+        current_time = time.time() if now is None else now
         config = self._config_for(tier)
-        self._refill(bucket, config, current_time)
+        state = await self._read_state(client_id, tier, current_time)
+        self._refill(state, config, current_time)
 
-        if bucket.tokens >= cost:
-            bucket.tokens -= cost
-            bucket.denial_count = 0
+        if state.tokens >= cost:
+            state.tokens -= cost
+            state.denial_count = 0
+            await self._write_state(client_id, tier, state)
             return RateLimitDecision(
                 allowed=True,
-                tokens_remaining=bucket.tokens,
+                tokens_remaining=state.tokens,
                 denial_count=0,
             )
 
-        bucket.denial_count += 1
-        shortfall = cost - bucket.tokens
+        state.denial_count += 1
+        shortfall = cost - state.tokens
         refill_wait = shortfall / config.refill_rate
         retry_after = max(
             refill_wait,
             min(
-                config.base_retry_after_seconds * (2 ** (bucket.denial_count - 1)),
+                config.base_retry_after_seconds * (2 ** (state.denial_count - 1)),
                 config.max_retry_after_seconds,
             ),
         )
+        await self._write_state(client_id, tier, state)
         return RateLimitDecision(
             allowed=False,
-            tokens_remaining=max(bucket.tokens, 0.0),
+            tokens_remaining=max(state.tokens, 0.0),
             retry_after_seconds=math.ceil(retry_after * 1000) / 1000,
-            denial_count=bucket.denial_count,
+            denial_count=state.denial_count,
         )
 
-    def _get_bucket(
+    async def _read_state(
         self,
         client_id: str,
         tier: RateLimitTier,
         now: float,
     ) -> TokenBucketState:
-        bucket_key = (client_id, tier)
-        bucket = self._buckets.get(bucket_key)
-        if bucket is None:
-            config = self._config_for(tier)
-            bucket = TokenBucketState(
-                tokens=float(config.capacity),
-                last_refill_monotonic=now,
-            )
-            self._buckets[bucket_key] = bucket
-        return bucket
+        key = self._state_key(client_id, tier)
+        record = await self._db.get_system_state_record(key)
+        config = self._config_for(tier)
+        if record is None or record["value_text"] is None:
+            return TokenBucketState(tokens=float(config.capacity), last_refill_epoch=now)
+        return TokenBucketState.from_json(record["value_text"], default_tokens=float(config.capacity), now=now)
+
+    async def _write_state(
+        self,
+        client_id: str,
+        tier: RateLimitTier,
+        state: TokenBucketState,
+    ) -> None:
+        await self._db.set_system_state(
+            self._state_key(client_id, tier),
+            value_text=state.to_json(),
+        )
 
     @staticmethod
     def _refill(bucket: TokenBucketState, config: TokenBucketConfig, now: float) -> None:
-        elapsed = max(0.0, now - bucket.last_refill_monotonic)
-        bucket.last_refill_monotonic = now
+        elapsed = max(0.0, now - bucket.last_refill_epoch)
+        bucket.last_refill_epoch = now
         bucket.tokens = min(config.capacity, bucket.tokens + elapsed * config.refill_rate)
+
+    @staticmethod
+    def _state_key(client_id: str, tier: RateLimitTier) -> str:
+        return f"rate_limit:{tier.value}:{client_id}"
 
     def _config_for(self, tier: RateLimitTier) -> TokenBucketConfig:
         if tier is RateLimitTier.RESOURCE:

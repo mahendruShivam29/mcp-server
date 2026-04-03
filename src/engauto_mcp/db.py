@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextvars
 import json
 import time
+import asyncio
 from collections.abc import Awaitable, Callable
 from contextvars import copy_context
 from pathlib import Path
@@ -24,6 +25,7 @@ class DatabaseManager:
         self.database_path = Path(database_path)
         self.connection: Any | None = None
         self.live_state: dict[str, tuple[str | None, int | None]] = {}
+        self._task_staging: dict[int, StagedState] = {}
 
     async def open(self) -> None:
         initialize_persistence(self.database_path)
@@ -45,17 +47,24 @@ class DatabaseManager:
         callback: Callable[["DatabaseManager"], Awaitable[Any]],
     ) -> Any:
         self._ensure_connection()
-        token = _staged_live_state.set({})
+        staged: StagedState = {}
+        token = _staged_live_state.set(staged)
+        task = asyncio.current_task()
+        task_id = id(task) if task is not None else None
+        if task_id is not None:
+            self._task_staging[task_id] = staged
         try:
             await self._execute("BEGIN IMMEDIATE;")
             result = await callback(self)
             await self._commit()
-            self._apply_staged_state()
+            self._apply_staged_state(staged)
             return result
         except Exception:
             await self._rollback()
             raise
         finally:
+            if task_id is not None:
+                self._task_staging.pop(task_id, None)
             _staged_live_state.reset(token)
 
     async def fetch_task(self, task_id: str) -> TaskRecord | None:
@@ -135,6 +144,8 @@ class DatabaseManager:
             (key, value_text, value_integer, now),
         )
         self.stage_live_state(key, value_text=value_text, value_integer=value_integer)
+        if self._active_staging() is None:
+            await self._commit()
 
     async def get_system_state(self, key: str) -> tuple[str | None, int | None] | None:
         row = await self._fetchone(
@@ -144,6 +155,13 @@ class DatabaseManager:
         if row is None:
             return None
         return row["value_text"], row["value_integer"]
+
+    async def get_system_state_record(self, key: str) -> dict[str, Any] | None:
+        row = await self._fetchone(
+            "SELECT key, value_text, value_integer, updated_at FROM system_state WHERE key = ?",
+            (key,),
+        )
+        return None if row is None else dict(row)
 
     async def write_read_heartbeat(self) -> int:
         now = _unix_timestamp()
@@ -167,7 +185,7 @@ class DatabaseManager:
         value_text: str | None = None,
         value_integer: int | None = None,
     ) -> None:
-        staged = _staged_live_state.get()
+        staged = self._active_staging()
         if staged is not None:
             staged[key] = (value_text, value_integer)
         else:
@@ -180,14 +198,23 @@ class DatabaseManager:
             for row in rows
         }
 
-    def _apply_staged_state(self) -> None:
-        staged = _staged_live_state.get()
+    def _apply_staged_state(self, staged: StagedState) -> None:
         if not staged:
             return
         self.live_state.update(staged)
 
+    def _active_staging(self) -> StagedState | None:
+        task = asyncio.current_task()
+        if task is not None:
+            staged = self._task_staging.get(id(task))
+            if staged is not None:
+                return staged
+        return _staged_live_state.get()
+
     async def _execute(self, sql: str, parameters: tuple[Any, ...] = ()) -> Any:
         self._ensure_connection()
+        # Touch staging before the aiosqlite thread handoff so task-local state remains visible.
+        self._active_staging()
         context = copy_context()
         cursor = await context.run(self.connection.execute, sql, parameters)
         return cursor

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from typing import Any
 
 from .compat import jsonpatch, require_dependency
@@ -22,6 +23,7 @@ class ToolService:
         sampling_guard: SamplingGuard,
         enqueue_deployment: Any,
         dependency_availability: dict[str, bool],
+        log_emitter: Any,
     ) -> None:
         self._db = db
         self._rate_limiter = rate_limiter
@@ -29,6 +31,7 @@ class ToolService:
         self._sampling_guard = sampling_guard
         self._enqueue_deployment = enqueue_deployment
         self._dependency_availability = dependency_availability
+        self._log_emitter = log_emitter
 
     def list_tools(self) -> list[dict[str, Any]]:
         return [
@@ -43,7 +46,7 @@ class ToolService:
         ]
 
     async def trigger_deployment(self, request: TriggerDeploymentRequest) -> dict[str, Any]:
-        self._rate_limiter.consume(request.client_id, RateLimitTier.TOOL)
+        await self._rate_limiter.consume(request.client_id, RateLimitTier.TOOL)
         patch_ops = list(request.patch)
         current_task = await self._db.fetch_task(request.task_id)
         if current_task is None:
@@ -106,12 +109,16 @@ class ToolService:
         heartbeat = await self._db.transaction(lambda db: db.write_read_heartbeat())
         wal_path = self._db.database_path.with_name(self._db.database_path.name + "-wal")
         wal_size = wal_path.stat().st_size if wal_path.exists() else 0
+        warning = None
+        if wal_size > 100 * 1024 * 1024:
+            warning = "WAL file exceeds 100MB."
         return EngineHealth(
             sqlite_version=await self._db.sqlite_version(),
             wal_file_size_bytes=wal_size,
             active_subscriptions_count=self._subscriptions.active_subscriptions_count(),
             heartbeat_timestamp=heartbeat,
             dependency_availability=self._dependency_availability,
+            warning=warning,
         )
 
     async def _apply_deployment_patch(
@@ -132,10 +139,11 @@ class ToolService:
             "etag": task.etag,
             **json.loads(task.payload_json),
         }
+        await self._claim_or_validate_lock(db)
         self._validate_test_operations(task_id, document, patch_ops)
 
-        patch_module = require_dependency("python-json-patch", jsonpatch)
-        patch = patch_module.JsonPatch(patch_ops)
+        patch_module = require_dependency("jsonpatch", jsonpatch)
+        patch = patch_module.JsonPatch([op for op in patch_ops if op.get("op") != "test"])
         updated_document = patch.apply(document, in_place=False)
         updated_document["status"] = "running"
         updated_document["deployment_environment"] = environment
@@ -168,6 +176,26 @@ class ToolService:
         expected = {"status": test_status, "etag": test_etag}
         actual = {"status": current_document.get("status"), "etag": current_document.get("etag")}
         if test_status is None or test_etag is None:
-            raise TOCTOUConflictError(task_id, expected, actual, f"tasks://{actual['status']}")
+            raise JsonRpcError(
+                -32012,
+                "Patch must include test operations for both /status and /etag.",
+                {"task_id": task_id},
+            )
         if test_status != actual["status"] or test_etag != actual["etag"]:
             raise TOCTOUConflictError(task_id, expected, actual, f"tasks://{actual['status']}")
+
+    async def _claim_or_validate_lock(self, db: DatabaseManager) -> None:
+        lock_record = await db.get_system_state_record("DEPLOY_LOCK")
+        if lock_record is None:
+            return
+        if lock_record["value_text"] != "RUNNING":
+            return
+        age_seconds = int(time.time()) - int(lock_record["updated_at"])
+        if age_seconds > 30 * 60:
+            await self._log_emitter("WARN", "Stale Lock Reclaimed")
+            return
+        raise JsonRpcError(
+            -32013,
+            "Deployment lock is already RUNNING.",
+            {"updated_at": lock_record["updated_at"]},
+        )
