@@ -5,6 +5,8 @@ from collections import defaultdict
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+from .db import DeferredOnCommitCallback
+
 NotificationEmitter = Callable[[str, dict[str, Any], set[str]], Awaitable[None]]
 OnCommitCallback = Callable[[], Awaitable[None]]
 
@@ -36,10 +38,10 @@ class SubscriptionManager:
         self,
         uri: str,
         *,
-        on_commit: list[OnCommitCallback] | None = None,
+        on_commit: list[OnCommitCallback | DeferredOnCommitCallback] | None = None,
     ) -> None:
         if on_commit is not None:
-            on_commit.append(lambda: self._schedule_emit(uri))
+            on_commit.append(DeferredOnCommitCallback(lambda: self._schedule_emit(uri)))
             return
         self._schedule_emit_now(uri)
 

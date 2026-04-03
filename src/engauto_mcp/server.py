@@ -45,6 +45,13 @@ class EngineeringAutomationServer:
         await self.db.open()
         secrets = load_cursor_secrets(self.database_path)
         self._instance_id = secrets.persistent_instance_id
+        self.logger = configure_logging(
+            sensitive_values=[
+                secrets.persistent_instance_id,
+                secrets.current_secret,
+                secrets.previous_secret or b"",
+            ]
+        )
         self._engine = BackgroundDeploymentEngine(
             self.db,
             self._subscriptions,
@@ -200,6 +207,13 @@ class EngineeringAutomationServer:
                 continue
             if failures / total > 0.05:
                 secrets = rotate_cursor_secret(self.database_path)
+                self.logger = configure_logging(
+                    sensitive_values=[
+                        secrets.persistent_instance_id,
+                        secrets.current_secret,
+                        secrets.previous_secret or b"",
+                    ]
+                )
                 if self._resources is not None:
                     self._resources.refresh_cursor_codec(HmacCursorCodec(secrets))
                 await self.db.set_system_state("cursor_decode_total", value_integer=0)

@@ -63,7 +63,11 @@ class EngineHealth(BaseModel):
     persistent_instance_id: str
     integrity_check_result: str
     foreign_key_check_results: list[dict[str, Any]]
+    wal_autocheckpoint_pages: int
+    page_count: int
+    main_db_size_bytes: int
     wal_file_size_bytes: int
+    wal_to_main_size_ratio: float
     active_subscriptions_count: int
     heartbeat_timestamp: int
     dependency_availability: dict[str, bool]

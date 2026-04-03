@@ -27,8 +27,8 @@ def _b64url_decode(encoded: str) -> bytes:
 
 @dataclass(frozen=True, slots=True)
 class DecodedCursor:
-    offset: int
-    timestamp: int
+    updated_at: int
+    task_id: str
     migration_hint: bool = False
 
 
@@ -36,9 +36,11 @@ class HmacCursorCodec:
     def __init__(self, secrets: CursorSecrets) -> None:
         self._secrets = secrets
 
-    def encode(self, offset: int, timestamp: int | None = None) -> str:
+    def encode(self, updated_at: int, task_id: str, timestamp: int | None = None) -> str:
         issued_at = int(time.time()) if timestamp is None else timestamp
-        body = f"{offset}|{issued_at}|{self._secrets.persistent_instance_id}".encode("utf-8")
+        body = (
+            f"{updated_at}|{task_id}|{issued_at}|{self._secrets.persistent_instance_id}"
+        ).encode("utf-8")
         mac = self._sign(body, self._secrets.current_secret)
         return _b64url_encode(body + mac)
 
@@ -58,7 +60,7 @@ class HmacCursorCodec:
             raise CursorValidationError("Cursor signature is invalid.")
 
         try:
-            offset_raw, timestamp_raw, instance_id = body.decode("utf-8").split("|", 2)
+            updated_at_raw, task_id, timestamp_raw, instance_id = body.decode("utf-8").split("|", 3)
         except ValueError as exc:
             raise CursorValidationError("Cursor payload is malformed.") from exc
 
@@ -69,8 +71,8 @@ class HmacCursorCodec:
             )
 
         return DecodedCursor(
-            offset=int(offset_raw),
-            timestamp=int(timestamp_raw),
+            updated_at=int(updated_at_raw),
+            task_id=task_id,
             migration_hint=used_previous_secret,
         )
 

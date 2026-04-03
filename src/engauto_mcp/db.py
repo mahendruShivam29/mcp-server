@@ -1,11 +1,8 @@
 from __future__ import annotations
 
-import contextvars
 import json
 import time
-import asyncio
 from collections.abc import Awaitable, Callable
-from contextvars import copy_context
 from pathlib import Path
 from typing import Any
 
@@ -14,10 +11,15 @@ from .models import TaskRecord
 from .persistence import initialize_persistence
 
 StagedState = dict[str, tuple[str | None, int | None]]
-_staged_live_state: contextvars.ContextVar[StagedState | None] = contextvars.ContextVar(
-    "staged_live_state",
-    default=None,
-)
+CommitCallback = Callable[[], Awaitable[None]]
+
+
+class DeferredOnCommitCallback:
+    def __init__(self, callback: CommitCallback) -> None:
+        self._callback = callback
+
+    async def __call__(self) -> None:
+        await self._callback()
 
 
 class DatabaseManager:
@@ -25,7 +27,6 @@ class DatabaseManager:
         self.database_path = Path(database_path)
         self.connection: Any | None = None
         self.live_state: dict[str, tuple[str | None, int | None]] = {}
-        self._task_staging: dict[int, StagedState] = {}
 
     async def open(self) -> None:
         initialize_persistence(self.database_path)
@@ -45,33 +46,32 @@ class DatabaseManager:
     async def transaction(
         self,
         callback: Callable[
-            ["DatabaseManager", StagedState, list[Callable[[], Awaitable[None]]]],
+            ["DatabaseManager", StagedState, list[CommitCallback | DeferredOnCommitCallback]],
             Awaitable[Any],
         ],
     ) -> Any:
         self._ensure_connection()
         staged: StagedState = {}
-        on_commit: list[Callable[[], Awaitable[None]]] = []
-        token = _staged_live_state.set(staged)
-        task = asyncio.current_task()
-        task_id = id(task) if task is not None else None
-        if task_id is not None:
-            self._task_staging[task_id] = staged
+        on_commit: list[CommitCallback | DeferredOnCommitCallback] = []
         try:
-            await self._execute("BEGIN IMMEDIATE;", staged=staged)
+            await self._execute("BEGIN IMMEDIATE;")
             result = await callback(self, staged, on_commit)
-            await self._commit(staged=staged)
+            await self._commit()
             self._apply_staged_state(staged)
-            for callback in on_commit:
-                await callback()
+            immediate_callbacks = [
+                item for item in on_commit if not isinstance(item, DeferredOnCommitCallback)
+            ]
+            deferred_callbacks = [
+                item for item in on_commit if isinstance(item, DeferredOnCommitCallback)
+            ]
+            for item in immediate_callbacks:
+                await item()
+            for item in deferred_callbacks:
+                await item()
             return result
         except Exception:
-            await self._rollback(staged=staged)
+            await self._rollback()
             raise
-        finally:
-            if task_id is not None:
-                self._task_staging.pop(task_id, None)
-            _staged_live_state.reset(token)
 
     async def fetch_task(self, task_id: str) -> TaskRecord | None:
         row = await self._fetchone(
@@ -85,18 +85,32 @@ class DatabaseManager:
         *,
         status: str,
         limit: int,
-        offset: int,
+        last_updated_at: int | None = None,
+        last_id: str | None = None,
     ) -> list[TaskRecord]:
-        rows = await self._fetchall(
-            """
-            SELECT id, title, status, etag, payload_json, created_at, updated_at
-            FROM tasks
-            WHERE status = ?
-            ORDER BY updated_at DESC, id
-            LIMIT ? OFFSET ?
-            """,
-            (status, limit, offset),
-        )
+        if last_updated_at is None or last_id is None:
+            rows = await self._fetchall(
+                """
+                SELECT id, title, status, etag, payload_json, created_at, updated_at
+                FROM tasks
+                WHERE status = ?
+                ORDER BY updated_at DESC, id DESC
+                LIMIT ?
+                """,
+                (status, limit),
+            )
+        else:
+            rows = await self._fetchall(
+                """
+                SELECT id, title, status, etag, payload_json, created_at, updated_at
+                FROM tasks
+                WHERE status = ?
+                  AND (updated_at, id) < (?, ?)
+                ORDER BY updated_at DESC, id DESC
+                LIMIT ?
+                """,
+                (status, last_updated_at, last_id, limit),
+            )
         return [TaskRecord.model_validate(dict(row)) for row in rows]
 
     async def update_task_document(
@@ -124,7 +138,6 @@ class DatabaseManager:
                 now,
                 task.id,
             ),
-            staged=staged,
         )
         return TaskRecord.model_validate(
             {
@@ -157,10 +170,9 @@ class DatabaseManager:
                 updated_at = excluded.updated_at
             """,
             (key, value_text, value_integer, now),
-            staged=staged,
         )
         self.stage_live_state(key, value_text=value_text, value_integer=value_integer, staged=staged)
-        if staged is None and self._active_staging() is None:
+        if staged is None:
             await self._commit()
 
     async def get_system_state(self, key: str) -> tuple[str | None, int | None] | None:
@@ -189,10 +201,7 @@ class DatabaseManager:
     async def write_read_heartbeat(self, *, staged: StagedState | None = None) -> int:
         now = _unix_timestamp()
         await self.set_system_state("HEARTBEAT", value_integer=now, staged=staged)
-        row = await self._fetchone(
-            "SELECT value_integer FROM system_state WHERE key = 'HEARTBEAT'",
-            staged=staged,
-        )
+        row = await self._fetchone("SELECT value_integer FROM system_state WHERE key = 'HEARTBEAT'")
         return int(row["value_integer"]) if row else now
 
     async def sqlite_version(self) -> str:
@@ -216,6 +225,18 @@ class DatabaseManager:
             return False
         return int(row[0]) == 0
 
+    async def wal_autocheckpoint_pages(self) -> int:
+        row = await self._fetchone("PRAGMA wal_autocheckpoint;")
+        return int(row[0]) if row is not None else 0
+
+    async def page_count(self) -> int:
+        row = await self._fetchone("PRAGMA page_count;")
+        return int(row[0]) if row is not None else 0
+
+    async def page_size(self) -> int:
+        row = await self._fetchone("PRAGMA page_size;")
+        return int(row[0]) if row is not None else 0
+
     def stage_live_state(
         self,
         key: str,
@@ -224,11 +245,10 @@ class DatabaseManager:
         value_integer: int | None = None,
         staged: StagedState | None = None,
     ) -> None:
-        active = staged if staged is not None else self._active_staging()
-        if active is not None:
-            active[key] = (value_text, value_integer)
-        else:
+        if staged is None:
             self.live_state[key] = (value_text, value_integer)
+            return
+        staged[key] = (value_text, value_integer)
 
     async def _load_live_state(self) -> None:
         rows = await self._fetchall("SELECT key, value_text, value_integer FROM system_state")
@@ -242,89 +262,37 @@ class DatabaseManager:
             return
         self.live_state.update(staged)
 
-    def _active_staging(self) -> StagedState | None:
-        task = asyncio.current_task()
-        if task is not None:
-            staged = self._task_staging.get(id(task))
-            if staged is not None:
-                return staged
-        return _staged_live_state.get()
-
     async def _execute(
         self,
         sql: str,
         parameters: tuple[Any, ...] = (),
-        *,
-        staged: StagedState | None = None,
     ) -> Any:
         self._ensure_connection()
-        active_staged = staged if staged is not None else self._active_staging()
-        context = copy_context()
-
-        def invoke() -> Any:
-            if active_staged is None:
-                return self.connection.execute(sql, parameters)
-            token = _staged_live_state.set(active_staged)
-            try:
-                return self.connection.execute(sql, parameters)
-            finally:
-                _staged_live_state.reset(token)
-
-        return await context.run(invoke)
+        return await self.connection.execute(sql, parameters)
 
     async def _fetchone(
         self,
         sql: str,
         parameters: tuple[Any, ...] = (),
-        *,
-        staged: StagedState | None = None,
     ) -> Any:
-        cursor = await self._execute(sql, parameters, staged=staged)
-        context = copy_context()
-        return await context.run(cursor.fetchone)
+        cursor = await self._execute(sql, parameters)
+        return await cursor.fetchone()
 
     async def _fetchall(
         self,
         sql: str,
         parameters: tuple[Any, ...] = (),
-        *,
-        staged: StagedState | None = None,
     ) -> list[Any]:
-        cursor = await self._execute(sql, parameters, staged=staged)
-        context = copy_context()
-        return await context.run(cursor.fetchall)
+        cursor = await self._execute(sql, parameters)
+        return await cursor.fetchall()
 
-    async def _commit(self, *, staged: StagedState | None = None) -> None:
+    async def _commit(self) -> None:
         self._ensure_connection()
-        active_staged = staged if staged is not None else self._active_staging()
-        context = copy_context()
+        await self.connection.commit()
 
-        def invoke() -> Any:
-            if active_staged is None:
-                return self.connection.commit()
-            token = _staged_live_state.set(active_staged)
-            try:
-                return self.connection.commit()
-            finally:
-                _staged_live_state.reset(token)
-
-        await context.run(invoke)
-
-    async def _rollback(self, *, staged: StagedState | None = None) -> None:
+    async def _rollback(self) -> None:
         self._ensure_connection()
-        active_staged = staged if staged is not None else self._active_staging()
-        context = copy_context()
-
-        def invoke() -> Any:
-            if active_staged is None:
-                return self.connection.rollback()
-            token = _staged_live_state.set(active_staged)
-            try:
-                return self.connection.rollback()
-            finally:
-                _staged_live_state.reset(token)
-
-        await context.run(invoke)
+        await self.connection.rollback()
 
     def _ensure_connection(self) -> None:
         if self.connection is None:

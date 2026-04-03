@@ -158,7 +158,7 @@ class BackgroundDeploymentEngine:
             staged: dict[str, tuple[str | None, int | None]],
             on_commit: list[Callable[[], Awaitable[None]]],
         ) -> None:
-            running_tasks = await db.list_tasks(status="running", limit=1000, offset=0)
+            running_tasks = await db.list_tasks(status="running", limit=1000)
             for task in running_tasks:
                 document = json.loads(task.payload_json)
                 document["status"] = "failed"

@@ -50,7 +50,8 @@ class TaskResourceService:
         status = parsed.netloc or parsed.path.lstrip("/")
         query = parse_qs(parsed.query)
         cursor = query.get("cursor", [None])[0]
-        offset = 0
+        last_updated_at: int | None = None
+        last_id: str | None = None
         migration_hint = False
         if cursor:
             self._record_cursor_metric(total=1, failures=0)
@@ -59,10 +60,18 @@ class TaskResourceService:
             except CursorValidationError:
                 self._record_cursor_metric(total=0, failures=1)
                 raise
-            offset = decoded.offset
+            last_updated_at = decoded.updated_at
+            last_id = decoded.task_id
             migration_hint = decoded.migration_hint
 
-        tasks = await self._db.list_tasks(status=status, limit=page_size, offset=offset)
+        tasks = await self._db.list_tasks(
+            status=status,
+            limit=page_size + 1,
+            last_updated_at=last_updated_at,
+            last_id=last_id,
+        )
+        has_next_page = len(tasks) > page_size
+        page_tasks = tasks[:page_size]
         items = [
             {
                 "id": task.id,
@@ -72,11 +81,12 @@ class TaskResourceService:
                 "payload": json.loads(task.payload_json),
                 "updated_at": task.updated_at,
             }
-            for task in tasks
+            for task in page_tasks
         ]
         next_cursor = None
-        if len(items) == page_size:
-            next_cursor = self._cursor_codec.encode(offset + page_size)
+        if has_next_page and page_tasks:
+            last_task = page_tasks[-1]
+            next_cursor = self._cursor_codec.encode(last_task.updated_at, last_task.id)
         normalized_uri = f"tasks://{status}"
         if cursor:
             normalized_uri = f"{normalized_uri}?{urlencode({'cursor': cursor})}"
