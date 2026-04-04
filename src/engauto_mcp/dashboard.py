@@ -2,58 +2,25 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from collections.abc import Awaitable, Callable
-from pathlib import Path
-import shlex
 import traceback
+from collections.abc import Awaitable
 from typing import Any
 
 import streamlit as st
 
-from engauto_mcp.client import MCPClient, _shutdown_process, _spawn_server, _start_in_process_server
+from engauto_mcp.client import MCPClient, _get_mcp_client
 from engauto_mcp.errors import JsonRpcError
 
 STATUS_ORDER = ("pending", "running", "completed", "failed")
 DEPLOY_TARGETS = ("dev", "staging", "prod")
 
 
-async def _with_client_session(
-    operation: Callable[[MCPClient], Awaitable[Any]],
-    server_command: list[str],
-) -> Any:
-    client: MCPClient | None = None
-    process: asyncio.subprocess.Process | None = None
-    server: Any | None = None
-    server_task: asyncio.Task[None] | None = None
-    try:
-        try:
-            process = await _spawn_server(server_command)
-            client = MCPClient(process)
-            await client.start()
-        except (PermissionError, NotImplementedError, OSError, RuntimeError):
-            client, server, server_task = await _start_in_process_server()
-        return await operation(client)
-    finally:
-        if client is not None:
-            with contextlib.suppress(Exception):
-                await client.stop()
-        if server_task is not None:
-            server_task.cancel()
-            await asyncio.gather(server_task, return_exceptions=True)
-        if server is not None:
-            await server.stop()
-        if process is not None:
-            await _shutdown_process(process)
-
-
-async def _fetch_task_snapshot(server_command: list[str]) -> dict[str, list[dict[str, Any]]]:
-    async def operation(client: MCPClient) -> dict[str, list[dict[str, Any]]]:
+async def _fetch_task_snapshot(server_url: str) -> dict[str, list[dict[str, Any]]]:
+    async with _get_mcp_client(server_url) as client:
         snapshot: dict[str, list[dict[str, Any]]] = {}
         for status in STATUS_ORDER:
             snapshot[status] = await _read_all_tasks(client, status)
         return snapshot
-
-    return await _with_client_session(operation, server_command)
 
 
 async def _read_all_tasks(client: MCPClient, status: str) -> list[dict[str, Any]]:
@@ -68,11 +35,11 @@ async def _read_all_tasks(client: MCPClient, status: str) -> list[dict[str, Any]
 
 
 async def _deploy_task(
-    server_command: list[str],
+    server_url: str,
     task: dict[str, Any],
     environment_target: str,
 ) -> dict[str, Any]:
-    async def operation(client: MCPClient) -> dict[str, Any]:
+    async with _get_mcp_client(server_url) as client:
         arguments = {
             "task_id": task["id"],
             "reason": f"Deploy {task['title']} from the dashboard to {environment_target}.",
@@ -83,8 +50,6 @@ async def _deploy_task(
             ],
         }
         return await client.call_tool_with_policy("trigger_deployment", arguments)
-
-    return await _with_client_session(operation, server_command)
 
 
 async def _read_resource_with_policy(client: MCPClient, uri: str) -> dict[str, Any]:
@@ -110,19 +75,12 @@ def _run_async(coro: Awaitable[Any]) -> Any:
         loop.close()
 
 
-def _default_server_command() -> list[str]:
-    return [
-        "powershell",
-        "-ExecutionPolicy",
-        "Bypass",
-        "-File",
-        str((st.session_state.get("_dashboard_root") / "scripts" / "run_server.ps1").resolve()),
-    ]
+def _default_server_url() -> str:
+    return "http://localhost:8000/sse"
 
 
 def render_dashboard() -> None:
     st.set_page_config(page_title="EngAuto MCP Dashboard", page_icon=":gear:", layout="wide")
-    st.session_state.setdefault("_dashboard_root", Path(__file__).resolve().parents[2])
     st.title("EngAuto MCP Dashboard")
     st.caption("Visual client for task state and deployment triggers.")
 
@@ -132,18 +90,14 @@ def render_dashboard() -> None:
         deploy_target = st.selectbox("Deploy Target", list(DEPLOY_TARGETS), index=0)
         auto_refresh = st.checkbox("Auto Refresh", value=True)
         refresh_seconds = st.slider("Refresh Interval", min_value=1, max_value=15, value=3)
-        server_command_input = st.text_input(
-            "Server Command",
-            value=" ".join(_default_server_command()),
-            help="Command used when a subprocess transport is available. The dashboard falls back to an in-process server if Windows blocks subprocess pipes.",
+        server_url = st.text_input(
+            "Server URL",
+            value=st.session_state.get("dashboard_server_url", _default_server_url()),
+            help="SSE endpoint for the long-lived EngAuto MCP server.",
         )
+        st.session_state["dashboard_server_url"] = server_url
         manual_refresh = st.button("Refresh Now", use_container_width=True)
 
-    server_command = (
-        shlex.split(server_command_input, posix=False)
-        if server_command_input.strip()
-        else _default_server_command()
-    )
     if auto_refresh:
         st.markdown(
             f"<meta http-equiv='refresh' content='{refresh_seconds}'>",
@@ -160,7 +114,7 @@ def render_dashboard() -> None:
         st.error(error_message)
 
     try:
-        snapshot = _run_async(_fetch_task_snapshot(server_command))
+        snapshot = _run_async(_fetch_task_snapshot(server_url))
     except Exception as exc:
         st.error(f"Failed to load task snapshot: {exc!r}")
         st.code(traceback.format_exc())
@@ -200,7 +154,7 @@ def render_dashboard() -> None:
         row[2].write(f"etag: {task['etag']}")
         if row[3].button("Deploy", key=f"deploy:{task['id']}", use_container_width=True):
             try:
-                result = _run_async(_deploy_task(server_command, task, deploy_target))
+                result = _run_async(_deploy_task(server_url, task, deploy_target))
             except JsonRpcError as exc:
                 st.session_state["dashboard_error"] = f"Deployment failed: {exc.message}"
             except Exception as exc:
