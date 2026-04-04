@@ -157,6 +157,40 @@ class DatabaseManager:
             }
         )
 
+    async def create_task(
+        self,
+        *,
+        task_id: str,
+        title: str,
+        status: str = "pending",
+        payload: dict[str, Any] | None = None,
+    ) -> TaskRecord:
+        now = _unix_timestamp()
+        payload_json = json.dumps(payload or {}, sort_keys=True)
+        try:
+            await self._execute(
+                """
+                INSERT INTO tasks (id, title, status, etag, payload_json, created_at, updated_at)
+                VALUES (?, ?, ?, 1, ?, ?, ?)
+                """,
+                (task_id, title, status, payload_json, now, now),
+            )
+        except Exception as exc:
+            if "UNIQUE constraint failed" in str(exc):
+                raise ValueError(f"Task '{task_id}' already exists.") from exc
+            raise
+        return TaskRecord.model_validate(
+            {
+                "id": task_id,
+                "title": title,
+                "status": status,
+                "etag": 1,
+                "payload_json": payload_json,
+                "created_at": now,
+                "updated_at": now,
+            }
+        )
+
     async def set_system_state(
         self,
         key: str,

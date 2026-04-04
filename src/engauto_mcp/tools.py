@@ -9,7 +9,13 @@ from .compat import jsonpatch, require_dependency
 from .config import LLM_INSTRUCTIONS
 from .db import DatabaseManager
 from .errors import JsonRpcError, TOCTOUConflictError
-from .models import EngineHealth, SamplingRequest, TriggerDeploymentRequest
+from .models import (
+    CreateTaskRequest,
+    EngineHealth,
+    SamplingRequest,
+    TriggerDeploymentRequest,
+    UpdateTaskRequest,
+)
 from .rate_limiter import RateLimitTier, TieredRateLimiter
 from .sampling import SamplingGuard
 from .subscriptions import SubscriptionManager
@@ -37,14 +43,110 @@ class ToolService:
     def list_tools(self) -> list[dict[str, Any]]:
         return [
             {
+                "name": "create_task",
+                "description": "Create a new pending task in SQLite.",
+                "inputSchema": self._tool_input_schema(CreateTaskRequest),
+            },
+            {
+                "name": "update_task",
+                "description": "Update a task title, status, or payload fields in SQLite.",
+                "inputSchema": self._tool_input_schema(UpdateTaskRequest),
+            },
+            {
                 "name": "trigger_deployment",
                 "description": "Trigger a mock deployment for a task with TOCTOU-safe JSON Patch validation.",
+                "inputSchema": self._tool_input_schema(TriggerDeploymentRequest),
             },
             {
                 "name": "get_engine_health",
                 "description": "Run a deep heartbeat health check.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": False,
+                },
             },
         ]
+
+    def _tool_input_schema(self, model_cls: type[Any]) -> dict[str, Any]:
+        if not hasattr(model_cls, "model_json_schema"):
+            return {"type": "object", "properties": {}, "additionalProperties": True}
+        schema = dict(model_cls.model_json_schema())
+        properties = dict(schema.get("properties", {}))
+        properties.pop("client_id", None)
+        schema["properties"] = properties
+        required = [name for name in schema.get("required", []) if name != "client_id"]
+        if required:
+            schema["required"] = required
+        else:
+            schema.pop("required", None)
+        schema.setdefault("type", "object")
+        schema.setdefault("additionalProperties", False)
+        return schema
+
+    async def create_task(self, request: CreateTaskRequest) -> dict[str, Any]:
+        await self._rate_limiter.consume(request.client_id, RateLimitTier.TOOL)
+
+        async def callback(
+            db: DatabaseManager,
+            on_commit: list[Callable[[], Awaitable[None]]],
+        ) -> dict[str, Any]:
+            try:
+                task = await db.create_task(
+                    task_id=request.task_id,
+                    title=request.title,
+                    payload=request.payload,
+                )
+            except ValueError as exc:
+                raise JsonRpcError(-32014, str(exc), {"task_id": request.task_id}) from exc
+            self._subscriptions.emit_resource_updated("tasks://pending", on_commit=on_commit)
+            return {
+                "task_id": task.id,
+                "title": task.title,
+                "status": task.status,
+                "etag": task.etag,
+            }
+
+        return await self._db.transaction(callback)
+
+    async def update_task(self, request: UpdateTaskRequest) -> dict[str, Any]:
+        await self._rate_limiter.consume(request.client_id, RateLimitTier.TOOL)
+
+        async def callback(
+            db: DatabaseManager,
+            on_commit: list[Callable[[], Awaitable[None]]],
+        ) -> dict[str, Any]:
+            task = await db.fetch_task(request.task_id)
+            if task is None:
+                raise JsonRpcError(-32010, f"Task '{request.task_id}' was not found.")
+
+            if request.expected_status is not None or request.expected_etag is not None:
+                expected = {
+                    "status": request.expected_status if request.expected_status is not None else task.status,
+                    "etag": request.expected_etag if request.expected_etag is not None else task.etag,
+                }
+                actual = {"status": task.status, "etag": task.etag}
+                if expected["status"] != actual["status"] or expected["etag"] != actual["etag"]:
+                    raise TOCTOUConflictError(task.id, expected, actual, f"tasks://{task.status}")
+
+            previous_status = task.status
+            document = json.loads(task.payload_json)
+            document.update(request.payload_updates)
+            if request.status is not None:
+                document["status"] = request.status
+            if request.title is not None:
+                document["title"] = request.title
+            updated_task = await db.update_task_document(task, document)
+            self._subscriptions.emit_resource_updated(f"tasks://{previous_status}", on_commit=on_commit)
+            self._subscriptions.emit_resource_updated(f"tasks://{updated_task.status}", on_commit=on_commit)
+            return {
+                "task_id": updated_task.id,
+                "title": updated_task.title,
+                "status": updated_task.status,
+                "etag": updated_task.etag,
+            }
+
+        return await self._db.transaction(callback)
 
     async def trigger_deployment(self, request: TriggerDeploymentRequest) -> dict[str, Any]:
         await self._rate_limiter.consume(request.client_id, RateLimitTier.TOOL)

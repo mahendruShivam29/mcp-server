@@ -14,7 +14,13 @@ from .engine import BackgroundDeploymentEngine
 from .errors import CursorValidationError, JsonRpcError
 from .jsonrpc import JsonRpcPeer, StdIOTransport
 from .logging_utils import configure_logging
-from .models import SamplingRequest, SamplingResponse, TriggerDeploymentRequest
+from .models import (
+    CreateTaskRequest,
+    SamplingRequest,
+    SamplingResponse,
+    TriggerDeploymentRequest,
+    UpdateTaskRequest,
+)
 from .persistence import load_cursor_secrets, rotate_cursor_secret
 from .rate_limiter import RateLimitTier, TieredRateLimiter
 from .resources import TaskResourceService
@@ -148,6 +154,16 @@ class EngineeringAutomationServer:
             assert self._tools is not None
             name = str(params["name"])
             arguments = dict(params.get("arguments", {}))
+            if name == "create_task":
+                request = CreateTaskRequest.model_validate(
+                    {"client_id": self.client_id, **arguments}
+                )
+                return await self._tools.create_task(request)
+            if name == "update_task":
+                request = UpdateTaskRequest.model_validate(
+                    {"client_id": self.client_id, **arguments}
+                )
+                return await self._tools.update_task(request)
             if name == "trigger_deployment":
                 request = TriggerDeploymentRequest.model_validate(
                     {"client_id": self.client_id, **arguments}

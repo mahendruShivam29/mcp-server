@@ -7,9 +7,10 @@ import json
 import os
 from pathlib import Path
 import sys
-import warnings
 from collections.abc import Awaitable, Callable
 from typing import Any
+
+from openai import OpenAI
 
 from .errors import JsonRpcError
 from .jsonrpc import JsonRpcPeer, StdIOTransport, encode_message, read_message_async
@@ -17,6 +18,8 @@ from .models import SamplingRequest, SamplingResponse
 from .server import EngineeringAutomationServer
 
 SamplingHandler = Callable[[SamplingRequest], Awaitable[SamplingResponse]]
+TASK_STATUSES = ("pending", "running", "completed", "failed")
+TERMINAL_TASK_STATUSES = {"completed", "failed"}
 
 
 class _FrameWriter:
@@ -49,6 +52,14 @@ class SubprocessTransport:
         self._process.stdin.write(frame)
         await self._process.stdin.drain()
 
+    async def close(self) -> None:
+        if self._process.stdin is not None:
+            self._process.stdin.close()
+            wait_closed = getattr(self._process.stdin, "wait_closed", None)
+            if callable(wait_closed):
+                with contextlib.suppress(BrokenPipeError, ConnectionResetError, OSError):
+                    await wait_closed()
+
 
 class ClientStdIOTransport:
     def __init__(self) -> None:
@@ -64,6 +75,9 @@ class ClientStdIOTransport:
     async def _write_frame(self, frame: bytes) -> None:
         await self._transport.write_message_bytes(frame)
 
+    async def close(self) -> None:
+        return None
+
 
 class _QueueTransport:
     def __init__(self, reader: asyncio.Queue[dict[str, Any] | None], writer: asyncio.Queue[dict[str, Any] | None]) -> None:
@@ -75,6 +89,9 @@ class _QueueTransport:
 
     async def write_message(self, payload: dict[str, Any]) -> None:
         await self._writer.put(payload)
+
+    async def close(self) -> None:
+        return None
 
 
 class MCPClient:
@@ -111,6 +128,10 @@ class MCPClient:
         if self._reader_task is not None:
             self._reader_task.cancel()
             await asyncio.gather(self._reader_task, return_exceptions=True)
+            self._reader_task = None
+        close_transport = getattr(self._transport, "close", None)
+        if callable(close_transport):
+            await close_transport()
 
     async def list_resources(self) -> dict[str, Any]:
         return await self._peer.send_request("resources/list", {})
@@ -131,12 +152,19 @@ class MCPClient:
         mutable_arguments = json.loads(json.dumps(arguments))
         while True:
             try:
-                return await self.call_tool(name, mutable_arguments)
+                result = await self.call_tool(name, mutable_arguments)
+                if name == "trigger_deployment":
+                    return await self._await_deployment_terminal_state(mutable_arguments, result)
+                return result
             except JsonRpcError as error:
                 if error.code == -32002:
                     retry_after = float((error.data or {}).get("retry_after", 0))
                     await asyncio.sleep(retry_after)
                     continue
+                # The deployment tools rely on JSON Patch "test" operations for /status and /etag
+                # as an optimistic concurrency guard. If the server returns -32003, the task was
+                # changed after the caller last read it. Re-reading the resource and updating those
+                # test values prevents a stale patch from silently applying to a newer task version.
                 if error.code == -32003 and await self._repair_patch_from_resource(
                     mutable_arguments,
                     error.data,
@@ -202,6 +230,32 @@ class MCPClient:
             arguments["_last_reread_resource_uri"] = resource_uri
         return repaired
 
+    async def _await_deployment_terminal_state(
+        self,
+        arguments: dict[str, Any],
+        result: dict[str, Any],
+    ) -> dict[str, Any]:
+        task_id = arguments.get("task_id")
+        if not isinstance(task_id, str) or not task_id:
+            return result
+
+        deadline = asyncio.get_running_loop().time() + 5.0
+        await asyncio.sleep(0.35)
+        delay = 0.1
+        latest = result
+        while asyncio.get_running_loop().time() < deadline:
+            task = await _find_task_item(self, task_id)
+            if task is not None:
+                latest = {
+                    "task_id": task["id"],
+                    "status": task["status"],
+                    "etag": task["etag"],
+                }
+                if task["status"] in TERMINAL_TASK_STATUSES:
+                    return latest
+            await asyncio.sleep(delay)
+        return latest
+
     async def run_stdio_forever(self) -> None:
         self._reader_task = asyncio.create_task(self._peer.serve_forever())
         await self._reader_task
@@ -229,6 +283,157 @@ async def _start_in_process_server() -> tuple[MCPClient, EngineeringAutomationSe
     return client, server, server_task
 
 
+async def _shutdown_process(process: asyncio.subprocess.Process) -> None:
+    transport = getattr(process, "_transport", None)
+    try:
+        if process.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
+                process.terminate()
+            try:
+                await asyncio.wait_for(process.wait(), timeout=5.0)
+            except asyncio.TimeoutError:
+                with contextlib.suppress(ProcessLookupError):
+                    process.kill()
+                await asyncio.wait_for(process.wait(), timeout=5.0)
+    finally:
+        if transport is not None:
+            with contextlib.suppress(RuntimeError, OSError):
+                transport.close()
+        await asyncio.sleep(0)
+
+
+async def _run_shell(client: MCPClient) -> int:
+    print("Connected. Commands: resources, tools, read <uri>, call <tool> <json>, exit", file=sys.stderr)
+    while True:
+        raw_command = await asyncio.to_thread(input, "engauto> ")
+        command = raw_command.strip()
+        if not command:
+            continue
+        lowered = command.lower()
+        if lowered in {"exit", "quit"}:
+            return 0
+        if lowered == "resources":
+            print(json.dumps(await client.list_resources(), indent=2))
+            continue
+        if lowered == "tools":
+            print(json.dumps(await client.list_tools(), indent=2))
+            continue
+        if lowered.startswith("read "):
+            uri = command[5:].strip()
+            if not uri:
+                print("Usage: read <uri>", file=sys.stderr)
+                continue
+            print(json.dumps(await client.read_resource(uri), indent=2))
+            continue
+        if lowered.startswith("call "):
+            remainder = command[5:].strip()
+            if not remainder:
+                print("Usage: call <tool> <json-arguments>", file=sys.stderr)
+                continue
+            name, _, json_payload = remainder.partition(" ")
+            arguments = {}
+            if json_payload.strip():
+                try:
+                    arguments = json.loads(json_payload)
+                except json.JSONDecodeError as exc:
+                    print(f"Invalid JSON arguments: {exc}", file=sys.stderr)
+                    continue
+            print(json.dumps(await client.call_tool_with_policy(name, arguments), indent=2))
+            continue
+        print("Unknown command. Use: resources, tools, read <uri>, call <tool> <json>, exit", file=sys.stderr)
+
+
+def _load_tool_arguments(args: argparse.Namespace) -> dict[str, Any]:
+    if getattr(args, "arguments_file", None):
+        raw_arguments = Path(args.arguments_file).read_text(encoding="utf-8")
+    else:
+        raw_arguments = getattr(args, "arguments", "{}")
+    return json.loads(raw_arguments) if raw_arguments else {}
+
+
+async def _read_resource_with_policy(client: MCPClient, uri: str) -> dict[str, Any]:
+    while True:
+        try:
+            return await client.read_resource(uri)
+        except JsonRpcError as error:
+            if error.code != -32002:
+                if error.code == -32603 and "cannot start a transaction within a transaction" in error.message:
+                    await asyncio.sleep(0.1)
+                    continue
+                raise
+            retry_after = float((error.data or {}).get("retry_after", 0))
+            await asyncio.sleep(retry_after)
+
+
+async def _find_task_item(client: MCPClient, task_id: str) -> dict[str, Any] | None:
+    for status in TASK_STATUSES:
+        uri = f"tasks://{status}"
+        while uri:
+            page = await _read_resource_with_policy(client, uri)
+            for item in page.get("items", []):
+                if item.get("id") == task_id:
+                    return item
+            uri = None
+            next_cursor = page.get("next_cursor")
+            if next_cursor:
+                uri = f"tasks://{status}?cursor={next_cursor}"
+    return None
+
+
+def _merge_deployment_patch(
+    patch: list[dict[str, Any]] | None,
+    *,
+    status: str,
+    etag: int,
+) -> list[dict[str, Any]]:
+    merged_patch = json.loads(json.dumps(patch or []))
+    status_set = False
+    etag_set = False
+    for op in merged_patch:
+        if op.get("op") != "test":
+            continue
+        if op.get("path") == "/status":
+            op["value"] = status
+            status_set = True
+        elif op.get("path") == "/etag":
+            op["value"] = etag
+            etag_set = True
+    if not status_set:
+        merged_patch.append({"op": "test", "path": "/status", "value": status})
+    if not etag_set:
+        merged_patch.append({"op": "test", "path": "/etag", "value": etag})
+    return merged_patch
+
+
+async def _finalize_planned_tool_call(
+    client: MCPClient,
+    tool_call: dict[str, Any],
+    query: str,
+) -> dict[str, Any]:
+    if tool_call.get("name") != "trigger_deployment":
+        return tool_call
+
+    arguments = json.loads(json.dumps(tool_call.get("arguments", {})))
+    task_id = arguments.get("task_id")
+    if not isinstance(task_id, str) or not task_id:
+        return tool_call
+
+    task = await _find_task_item(client, task_id)
+    if task is None:
+        return tool_call
+
+    arguments.setdefault("reason", query)
+    environment = arguments.get("environment")
+    if not isinstance(environment, dict):
+        arguments["environment"] = {}
+    arguments["patch"] = _merge_deployment_patch(
+        arguments.get("patch"),
+        status=str(task["status"]),
+        etag=int(task["etag"]),
+    )
+    return {"name": "trigger_deployment", "arguments": arguments}
+
+
 async def _run_cli(args: argparse.Namespace) -> int:
     if args.command == "stdio-proxy":
         client = MCPClient(transport=ClientStdIOTransport())
@@ -242,7 +447,7 @@ async def _run_cli(args: argparse.Namespace) -> int:
         process = await _spawn_server(args.server_command)
         client = MCPClient(process)
         await client.start()
-    except PermissionError:
+    except (PermissionError, NotImplementedError, OSError, RuntimeError):
         client, server, server_task = await _start_in_process_server()
     try:
         if args.command == "resources-list":
@@ -252,20 +457,27 @@ async def _run_cli(args: argparse.Namespace) -> int:
         elif args.command == "resource-read":
             print(json.dumps(await client.read_resource(args.uri), indent=2))
         elif args.command == "tool-call":
-            arguments = json.loads(args.arguments) if args.arguments else {}
+            arguments = _load_tool_arguments(args)
             print(json.dumps(await client.call_tool_with_policy(args.name, arguments), indent=2))
         elif args.command == "ask":
             resource_uri = _infer_task_resource_uri(args.query)
             if resource_uri is not None:
                 print(json.dumps(await client.read_resource(resource_uri), indent=2))
             else:
-                tool_call = await _plan_tool_call_with_gemini(client, args.query)
-                print(
-                    json.dumps(
-                        await client.call_tool_with_policy(tool_call["name"], tool_call["arguments"]),
-                        indent=2,
+                direct_response = await _maybe_handle_direct_query(client, args.query)
+                if direct_response is not None:
+                    print(json.dumps(direct_response, indent=2))
+                else:
+                    tool_call = await _plan_tool_call_with_openai(client, args.query)
+                    tool_call = await _finalize_planned_tool_call(client, tool_call, args.query)
+                    print(
+                        json.dumps(
+                            await client.call_tool_with_policy(tool_call["name"], tool_call["arguments"]),
+                            indent=2,
+                        )
                     )
-                )
+        elif args.command == "shell":
+            return await _run_shell(client)
         return 0
     finally:
         await client.stop()
@@ -275,69 +487,83 @@ async def _run_cli(args: argparse.Namespace) -> int:
         if server is not None:
             await server.stop()
         if process is not None:
-            with contextlib.suppress(ProcessLookupError):
-                process.terminate()
-            try:
-                await asyncio.wait_for(process.wait(), timeout=5.0)
-            except asyncio.TimeoutError:
+            if process.stdin is not None:
+                with contextlib.suppress(BrokenPipeError, ConnectionResetError, OSError):
+                    process.stdin.close()
+                    wait_closed = getattr(process.stdin, "wait_closed", None)
+                    if callable(wait_closed):
+                        await wait_closed()
+            if process.returncode is None:
                 with contextlib.suppress(ProcessLookupError):
-                    process.kill()
-                await asyncio.wait_for(process.wait(), timeout=5.0)
+                    process.terminate()
+                try:
+                    await asyncio.wait_for(process.wait(), timeout=5.0)
+                except asyncio.TimeoutError:
+                    with contextlib.suppress(ProcessLookupError):
+                        process.kill()
+                    await asyncio.wait_for(process.wait(), timeout=5.0)
+            transport = getattr(process, "_transport", None)
+            if transport is not None:
+                with contextlib.suppress(RuntimeError, OSError):
+                    transport.close()
+            await asyncio.sleep(0)
 
 
-async def _plan_tool_call_with_gemini(
+async def _plan_tool_call_with_openai(
     client: MCPClient,
     query: str,
 ) -> dict[str, Any]:
-    api_key = os.environ.get("GOOGLE_API_KEY")
+    api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
-        print("GOOGLE_API_KEY is not set. The ask command requires Gemini access.", file=sys.stderr)
+        print("OPENAI_API_KEY is not set. The ask command requires OpenAI access.", file=sys.stderr)
         raise SystemExit(2)
 
-    with warnings.catch_warnings():
-        warnings.filterwarnings("ignore", category=FutureWarning, module="google.generativeai")
-        import google.generativeai as genai
-
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel("gemini-flash-latest")
+    openai_client = OpenAI(api_key=api_key)
     tools_response = await client.list_tools()
-    resources_response = await client.list_resources()
-    prompt = _build_gemini_prompt(
-        query=query,
-        tools=tools_response.get("tools", []),
-        resources=resources_response.get("resources", []),
-    )
+    openai_tools = _build_openai_tools(tools_response.get("tools", []))
+    if not openai_tools:
+        print("The server did not return any callable tool schemas.", file=sys.stderr)
+        raise SystemExit(2)
 
     try:
         response = await asyncio.wait_for(
             asyncio.to_thread(
-                model.generate_content,
-                prompt,
-                generation_config={
-                    "response_mime_type": "application/json",
-                },
+                openai_client.chat.completions.create,
+                model="gpt-4o-mini",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a planner for a minimal MCP client. "
+                            "Choose exactly one tool call that best satisfies the user request. "
+                            "Use the provided tool schemas exactly as given. "
+                            "Do not invent argument names. "
+                            "If required arguments are missing from the user request, make the best safe guess only when the schema allows it."
+                        ),
+                    },
+                    {"role": "user", "content": query},
+                ],
+                tools=openai_tools,
+                tool_choice="required",
             ),
             timeout=20.0,
         )
-        raw_text = getattr(response, "text", "") or ""
-        tool_call = json.loads(raw_text)
+        message = response.choices[0].message
+        tool_calls = message.tool_calls or []
+        if not tool_calls:
+            raise ValueError("OpenAI returned no tool call.")
+        selected_call = tool_calls[0]
+        name = selected_call.function.name
+        arguments = json.loads(selected_call.function.arguments or "{}")
     except asyncio.TimeoutError as exc:
-        print("Gemini request timed out after 20 seconds.", file=sys.stderr)
+        print("OpenAI request timed out after 20 seconds.", file=sys.stderr)
         raise SystemExit(2) from exc
     except Exception as exc:
-        print(f"Gemini failed to produce a valid tool call: {exc}", file=sys.stderr)
+        print(f"OpenAI failed to produce a valid tool call: {exc}", file=sys.stderr)
         raise SystemExit(2) from exc
 
-    if not isinstance(tool_call, dict):
-        print("Gemini returned a non-object response for the tool call.", file=sys.stderr)
-        raise SystemExit(2)
-    name = tool_call.get("name")
-    arguments = tool_call.get("arguments")
     if not isinstance(name, str) or not isinstance(arguments, dict):
-        print(
-            "Gemini did not return valid tool JSON. Expected {\"name\": \"tool_name\", \"arguments\": {...}}.",
-            file=sys.stderr,
-        )
+        print("OpenAI did not return a valid schema-constrained tool call.", file=sys.stderr)
         raise SystemExit(2)
     return {"name": name, "arguments": arguments}
 
@@ -352,29 +578,64 @@ def _infer_task_resource_uri(query: str) -> str | None:
     return None
 
 
-def _build_gemini_prompt(
-    *,
-    query: str,
-    tools: list[dict[str, Any]],
-    resources: list[dict[str, Any]],
-) -> str:
-    return (
-        "You are a planner for a minimal MCP client.\n"
-        "Choose exactly one MCP tool call that best satisfies the user request.\n"
-        "You must output strictly valid JSON only, with no markdown and no explanation.\n"
-        'Use this exact format: {"name": "tool_name", "arguments": {...}}.\n'
-        "Available tools:\n"
-        f"{json.dumps(tools, indent=2, ensure_ascii=True)}\n"
-        "Available resources:\n"
-        f"{json.dumps(resources, indent=2, ensure_ascii=True)}\n"
-        "Safety requirements:\n"
-        "- If the user mentions deploy, deployment, or releasing, use the trigger_deployment tool.\n"
-        "- For trigger_deployment, ensure arguments include reason and environment.\n"
-        "- Use only tool names that exist in the available tools list.\n"
-        "- Return one tool call only.\n"
-        "User instruction:\n"
-        f"{query}\n"
-    )
+async def _maybe_handle_direct_query(client: MCPClient, query: str) -> dict[str, Any] | None:
+    lowered = " ".join(query.lower().split())
+
+    if _mentions_any(lowered, ("tool list", "tools list", "list tools", "show tools", "show tool list")):
+        return await client.list_tools()
+    if _mentions_any(
+        lowered,
+        (
+            "resource list",
+            "resources list",
+            "list resources",
+            "show resources",
+            "show resource list",
+        ),
+    ):
+        return await client.list_resources()
+    if _mentions_any(
+        lowered,
+        (
+            "template list",
+            "templates list",
+            "list templates",
+            "show templates",
+            "show template list",
+        ),
+    ):
+        return await client.list_templates()
+
+    return None
+
+
+def _mentions_any(query: str, phrases: tuple[str, ...]) -> bool:
+    return any(phrase in query for phrase in phrases)
+
+def _build_openai_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    tool_definitions: list[dict[str, Any]] = []
+    for tool in tools:
+        name = tool.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        input_schema = tool.get("inputSchema") or tool.get("input_schema") or {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": False,
+        }
+        if not isinstance(input_schema, dict):
+            continue
+        tool_definitions.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": str(tool.get("description", "")),
+                    "parameters": input_schema,
+                },
+            }
+        )
+    return tool_definitions
 
 
 def _default_server_command() -> list[str]:
@@ -405,9 +666,12 @@ def build_parser() -> argparse.ArgumentParser:
     resource_read.add_argument("uri")
     tool_call = subparsers.add_parser("tool-call")
     tool_call.add_argument("name")
-    tool_call.add_argument("--arguments", default="{}")
+    tool_call_arguments = tool_call.add_mutually_exclusive_group()
+    tool_call_arguments.add_argument("--arguments", default="{}")
+    tool_call_arguments.add_argument("--arguments-file")
     ask = subparsers.add_parser("ask")
     ask.add_argument("query")
+    subparsers.add_parser("shell")
     subparsers.add_parser("stdio-proxy")
     return parser
 
@@ -419,9 +683,11 @@ def main(argv: list[str] | None = None) -> int:
         return asyncio.run(_run_cli(args))
     except KeyboardInterrupt:
         return 130
-    except Exception:
-        return 0
+    except Exception as exc:
+        print(f"Client failed: {exc!r}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
