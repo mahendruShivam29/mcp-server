@@ -56,6 +56,27 @@ class TriggerDeploymentRequest(BaseModel):
     reason: str
 
 
+class CreateTaskRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    client_id: str
+    task_id: str
+    title: str
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+
+class UpdateTaskRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    client_id: str
+    task_id: str
+    title: str | None = None
+    status: Literal["pending", "running", "completed", "failed"] | None = None
+    payload_updates: dict[str, Any] = Field(default_factory=dict)
+    expected_status: Literal["pending", "running", "completed", "failed"] | None = None
+    expected_etag: int | None = None
+
+
 class EngineHealth(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
