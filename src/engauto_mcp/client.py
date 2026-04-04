@@ -28,13 +28,17 @@ class MCPClient:
 
     async def list_resources(self) -> dict[str, Any]:
         result = await self._session.list_resources()
-        return {"resources": [resource.model_dump(exclude_none=True) for resource in result.resources]}
+        return {
+            "resources": [
+                resource.model_dump(mode="json", exclude_none=True) for resource in result.resources
+            ]
+        }
 
     async def list_templates(self) -> dict[str, Any]:
         result = await self._session.list_resource_templates()
         return {
             "resourceTemplates": [
-                template.model_dump(exclude_none=True)
+                template.model_dump(mode="json", exclude_none=True)
                 for template in result.resourceTemplates
             ]
         }
@@ -52,13 +56,18 @@ class MCPClient:
             except json.JSONDecodeError:
                 return {
                     "uri": uri,
-                    "contents": [content.model_dump(exclude_none=True) for content in contents],
+                    "contents": [
+                        content.model_dump(mode="json", exclude_none=True) for content in contents
+                    ],
                 }
-        return {"uri": uri, "contents": [content.model_dump(exclude_none=True) for content in contents]}
+        return {
+            "uri": uri,
+            "contents": [content.model_dump(mode="json", exclude_none=True) for content in contents],
+        }
 
     async def list_tools(self) -> dict[str, Any]:
         result = await self._session.list_tools()
-        return {"tools": [tool.model_dump(exclude_none=True) for tool in result.tools]}
+        return {"tools": [tool.model_dump(mode="json", exclude_none=True) for tool in result.tools]}
 
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         result = await self._session.call_tool(name, arguments)
@@ -167,7 +176,7 @@ def _content_blocks_to_payload(content_blocks: list[Any]) -> dict[str, Any]:
                     return payload
             except json.JSONDecodeError:
                 return {"text": text}
-    return {"content": [block.model_dump(exclude_none=True) for block in content_blocks]}
+    return {"content": [block.model_dump(mode="json", exclude_none=True) for block in content_blocks]}
 
 
 def _tool_error_to_jsonrpc(result: types.CallToolResult) -> JsonRpcError:
@@ -212,7 +221,11 @@ async def _sampling_callback(
     params: types.CreateMessageRequestParams,
 ) -> types.CreateMessageResult:
     request = _parse_sampling_request(params)
-    response = _build_sampling_response(request)
+    approved = await _confirm_sampling_request(request)
+    if approved:
+        response = _build_sampling_response(request)
+    else:
+        response = SamplingResponse(approved=False, patch=None, message="Deployment was denied by the terminal operator.")
     return types.CreateMessageResult(
         role="assistant",
         model="engauto-mcp-client",
@@ -250,19 +263,73 @@ def _build_sampling_response(request: SamplingRequest) -> SamplingResponse:
     return SamplingResponse(approved=True, patch=patch, message="Auto-approved remediation")
 
 
+async def _confirm_sampling_request(request: SamplingRequest) -> bool:
+    if not sys.stdin.isatty():
+        print(
+            "Sampling approval requires an interactive terminal. Denying deployment by default.",
+            file=sys.stderr,
+        )
+        return False
+
+    prompt = _format_sampling_prompt(request)
+    response = await asyncio.to_thread(input, prompt)
+    return response.strip().lower() in {"y", "yes"}
+
+
+def _format_sampling_prompt(request: SamplingRequest) -> str:
+    lines = [
+        "",
+        "Deployment approval required.",
+        f"Task: {request.task_id}",
+        f"Reason: {request.reason}",
+        f"Current status: {request.current_status}",
+        f"Environment: {json.dumps(request.environment, ensure_ascii=True, sort_keys=True)}",
+    ]
+    if request.diff:
+        lines.append(f"Diff: {json.dumps(request.diff, ensure_ascii=True, sort_keys=True)}")
+    if request.original_error:
+        lines.append(
+            f"Conflict: {json.dumps(request.original_error.get('data', {}), ensure_ascii=True, sort_keys=True)}"
+        )
+    lines.append("Approve deployment? [y/N]: ")
+    return "\n".join(lines)
+
+
 @contextlib.asynccontextmanager
-async def _get_mcp_client(server_url: str) -> AsyncIterator[MCPClient]:
+async def _get_mcp_client(
+    server_url: str,
+    *,
+    sampling_callback: Any | None = None,
+) -> AsyncIterator[MCPClient]:
     async with sse_client(server_url) as (read_stream, write_stream):
         async with ClientSession(
             read_stream,
             write_stream,
-            sampling_callback=_sampling_callback,
+            sampling_callback=sampling_callback or _sampling_callback,
             sampling_capabilities=types.SamplingCapability(),
             logging_callback=_logging_callback,
             client_info=types.Implementation(name="engauto-mcp-client", version="0.1.0"),
         ) as session:
             await session.initialize()
             yield MCPClient(session)
+
+
+async def _run_client_operation(
+    server_url: str,
+    operation: Any,
+    *,
+    sampling_callback: Any | None = None,
+) -> Any:
+    pending_error: Exception | None = None
+    pending_result: Any = None
+    async with _get_mcp_client(server_url, sampling_callback=sampling_callback) as client:
+        try:
+            pending_result = await operation(client)
+        except Exception as exc:
+            pending_error = exc
+    if pending_error is not None:
+        raise pending_error
+    return pending_result
 
 
 async def _run_shell(client: MCPClient) -> int:
@@ -395,36 +462,35 @@ async def _finalize_planned_tool_call(
 
 
 async def _run_cli(args: argparse.Namespace) -> int:
-    async with _get_mcp_client(args.server_url) as client:
-        if args.command == "resources-list":
-            print(json.dumps(await client.list_resources(), indent=2))
-        elif args.command == "templates-list":
-            print(json.dumps(await client.list_templates(), indent=2))
-        elif args.command == "resource-read":
-            print(json.dumps(await client.read_resource(args.uri), indent=2))
-        elif args.command == "tool-call":
-            arguments = _load_tool_arguments(args)
-            print(json.dumps(await client.call_tool_with_policy(args.name, arguments), indent=2))
-        elif args.command == "ask":
-            resource_uri = _infer_task_resource_uri(args.query)
-            if resource_uri is not None:
-                print(json.dumps(await client.read_resource(resource_uri), indent=2))
-            else:
-                direct_response = await _maybe_handle_direct_query(client, args.query)
-                if direct_response is not None:
-                    print(json.dumps(direct_response, indent=2))
-                else:
-                    tool_call = await _plan_tool_call_with_openai(client, args.query)
-                    tool_call = await _finalize_planned_tool_call(client, tool_call, args.query)
-                    print(
-                        json.dumps(
-                            await client.call_tool_with_policy(tool_call["name"], tool_call["arguments"]),
-                            indent=2,
-                        )
-                    )
-        elif args.command == "shell":
-            return await _run_shell(client)
-        return 0
+    if args.command == "resources-list":
+        result = await _run_client_operation(args.server_url, lambda client: client.list_resources())
+        print(json.dumps(result, indent=2))
+    elif args.command == "tools-list":
+        result = await _run_client_operation(args.server_url, lambda client: client.list_tools())
+        print(json.dumps(result, indent=2))
+    elif args.command == "templates-list":
+        result = await _run_client_operation(args.server_url, lambda client: client.list_templates())
+        print(json.dumps(result, indent=2))
+    elif args.command == "resource-read":
+        result = await _run_client_operation(args.server_url, lambda client: client.read_resource(args.uri))
+        print(json.dumps(result, indent=2))
+    elif args.command == "tool-call":
+        arguments = _load_tool_arguments(args)
+        result = await _run_client_operation(
+            args.server_url,
+            lambda client: client.call_tool_with_policy(args.name, arguments),
+        )
+        print(json.dumps(result, indent=2))
+    elif args.command == "ask":
+        async def operation(client: MCPClient) -> dict[str, Any]:
+            planned_action = await _plan_tool_call_with_openai(client, args.query)
+            return await _execute_planned_action(client, planned_action, args.query)
+
+        result = await _run_client_operation(args.server_url, operation)
+        print(json.dumps(result, indent=2))
+    elif args.command == "shell":
+        return await _run_client_operation(args.server_url, _run_shell)
+    return 0
 
 
 async def _plan_tool_call_with_openai(
@@ -433,15 +499,17 @@ async def _plan_tool_call_with_openai(
 ) -> dict[str, Any]:
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
-        print("OPENAI_API_KEY is not set. The ask command requires OpenAI access.", file=sys.stderr)
-        raise SystemExit(2)
+        raise RuntimeError("OPENAI_API_KEY is not set. The ask command requires OpenAI access.")
 
     openai_client = OpenAI(api_key=api_key)
     tools_response = await client.list_tools()
-    openai_tools = _build_openai_tools(tools_response.get("tools", []))
+    resources_response = await client.list_resources()
+    openai_tools = _build_openai_tools(
+        tools_response.get("tools", []),
+        resources_response.get("resources", []),
+    )
     if not openai_tools:
-        print("The server did not return any callable tool schemas.", file=sys.stderr)
-        raise SystemExit(2)
+        raise RuntimeError("The server did not return any callable tool schemas.")
 
     try:
         response = await asyncio.wait_for(
@@ -453,8 +521,9 @@ async def _plan_tool_call_with_openai(
                         "role": "system",
                         "content": (
                             "You are a planner for a minimal MCP client. "
-                            "Choose exactly one tool call that best satisfies the user request. "
-                            "Use the provided tool schemas exactly as given. "
+                            "Choose exactly one function call that best satisfies the user request. "
+                            "The available functions include both server tools and client-side resource actions. "
+                            "Use the provided schemas exactly as given. "
                             "Do not invent argument names. "
                             "If required arguments are missing from the user request, make the best safe guess only when the schema allows it."
                         ),
@@ -473,65 +542,20 @@ async def _plan_tool_call_with_openai(
         selected_call = tool_calls[0]
         name = selected_call.function.name
         arguments = json.loads(selected_call.function.arguments or "{}")
-    except asyncio.TimeoutError as exc:
-        print("OpenAI request timed out after 20 seconds.", file=sys.stderr)
-        raise SystemExit(2) from exc
     except Exception as exc:
-        print(f"OpenAI failed to produce a valid tool call: {exc}", file=sys.stderr)
-        raise SystemExit(2) from exc
+        if isinstance(exc, asyncio.TimeoutError):
+            raise RuntimeError("OpenAI request timed out after 20 seconds.") from exc
+        raise RuntimeError(f"OpenAI failed to produce a valid tool call: {exc}") from exc
 
     if not isinstance(name, str) or not isinstance(arguments, dict):
-        print("OpenAI did not return a valid schema-constrained tool call.", file=sys.stderr)
-        raise SystemExit(2)
+        raise RuntimeError("OpenAI did not return a valid schema-constrained tool call.")
     return {"name": name, "arguments": arguments}
 
 
-def _infer_task_resource_uri(query: str) -> str | None:
-    lowered = query.lower()
-    if "task" not in lowered:
-        return None
-    for status in TASK_STATUSES:
-        if status in lowered:
-            return f"tasks://{status}"
-    return None
-
-
-async def _maybe_handle_direct_query(client: MCPClient, query: str) -> dict[str, Any] | None:
-    lowered = " ".join(query.lower().split())
-
-    if _mentions_any(lowered, ("tool list", "tools list", "list tools", "show tools", "show tool list")):
-        return await client.list_tools()
-    if _mentions_any(
-        lowered,
-        (
-            "resource list",
-            "resources list",
-            "list resources",
-            "show resources",
-            "show resource list",
-        ),
-    ):
-        return await client.list_resources()
-    if _mentions_any(
-        lowered,
-        (
-            "template list",
-            "templates list",
-            "list templates",
-            "show templates",
-            "show template list",
-        ),
-    ):
-        return await client.list_templates()
-
-    return None
-
-
-def _mentions_any(query: str, phrases: tuple[str, ...]) -> bool:
-    return any(phrase in query for phrase in phrases)
-
-
-def _build_openai_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _build_openai_tools(
+    tools: list[dict[str, Any]],
+    resources: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
     tool_definitions: list[dict[str, Any]] = []
     for tool in tools:
         name = tool.get("name")
@@ -554,11 +578,107 @@ def _build_openai_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 },
             }
         )
+    resource_uris = [
+        resource.get("uri")
+        for resource in (resources or [])
+        if isinstance(resource, dict) and isinstance(resource.get("uri"), str)
+    ]
+    if resource_uris:
+        tool_definitions.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": "read_resource",
+                    "description": (
+                        "Read one server resource by URI. Use this for queries about current task state, "
+                        "such as pending, running, completed, or failed tasks."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "uri": {
+                                "type": "string",
+                                "enum": resource_uris,
+                                "description": "The exact resource URI to read.",
+                            }
+                        },
+                        "required": ["uri"],
+                        "additionalProperties": False,
+                    },
+                },
+            }
+        )
+    tool_definitions.extend(
+        [
+            {
+                "type": "function",
+                "function": {
+                    "name": "list_resources",
+                    "description": "List currently available server resources.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "list_resource_templates",
+                    "description": "List currently available server resource templates.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "list_tools",
+                    "description": "List currently available server tools and their schemas.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": False,
+                    },
+                },
+            },
+        ]
+    )
     return tool_definitions
 
 
+async def _execute_planned_action(
+    client: MCPClient,
+    planned_action: dict[str, Any],
+    query: str,
+) -> dict[str, Any]:
+    name = planned_action.get("name")
+    arguments = planned_action.get("arguments", {})
+    if not isinstance(name, str) or not isinstance(arguments, dict):
+        raise RuntimeError("OpenAI did not return a valid schema-constrained tool call.")
+
+    if name == "read_resource":
+        uri = arguments.get("uri")
+        if not isinstance(uri, str) or not uri:
+            raise RuntimeError("OpenAI selected read_resource without a valid uri.")
+        return await client.read_resource(uri)
+    if name == "list_resources":
+        return await client.list_resources()
+    if name == "list_resource_templates":
+        return await client.list_templates()
+    if name == "list_tools":
+        return await client.list_tools()
+
+    tool_call = await _finalize_planned_tool_call(client, planned_action, query)
+    return await client.call_tool_with_policy(tool_call["name"], tool_call["arguments"])
+
+
 def _default_server_url() -> str:
-    return os.environ.get("ENGAUTO_MCP_SERVER_URL", "http://localhost:8000/sse")
+    return os.environ.get("ENGAUTO_MCP_SERVER_URL", "http://localhost:8000/sse/")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -570,6 +690,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("resources-list")
+    subparsers.add_parser("tools-list")
     subparsers.add_parser("templates-list")
     resource_read = subparsers.add_parser("resource-read")
     resource_read.add_argument("uri")
