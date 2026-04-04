@@ -11,7 +11,7 @@ from mcp.server import NotificationOptions, Server
 from mcp.server.lowlevel.helper_types import ReadResourceContents
 from mcp.server.sse import SseServerTransport
 from starlette.applications import Starlette
-from starlette.routing import Mount
+from starlette.responses import PlainTextResponse
 
 from .compat import DEPENDENCY_AVAILABILITY
 from .config import DEFAULT_DB_PATH
@@ -47,13 +47,8 @@ class EngineeringAutomationServer:
         self._instance_id = ""
         self._sessions: dict[str, Any] = {}
         self._register_handlers()
-        self.app = Starlette(
-            lifespan=self._lifespan,
-            routes=[
-                Mount("/sse", app=self._handle_sse),
-                Mount("/sse/messages", app=self._handle_messages),
-            ],
-        )
+        self._starlette = Starlette(lifespan=self._lifespan)
+        self.app = _ServerApp(self)
 
     async def start(self) -> None:
         await self.db.open()
@@ -123,6 +118,27 @@ class EngineeringAutomationServer:
 
     async def _handle_messages(self, scope, receive, send) -> None:
         await self.sse_transport.handle_post_message(scope, receive, send)
+
+    async def _asgi_app(self, scope, receive, send) -> None:
+        scope_type = scope.get("type")
+        if scope_type == "lifespan":
+            await self._starlette(scope, receive, send)
+            return
+        if scope_type != "http":
+            response = PlainTextResponse("Unsupported scope type", status_code=500)
+            await response(scope, receive, send)
+            return
+
+        path = scope.get("path", "")
+        if path in {"/sse", "/sse/"}:
+            await self._handle_sse(scope, receive, send)
+            return
+        if path in {"/messages", "/messages/", "/sse/messages", "/sse/messages/"}:
+            await self._handle_messages(scope, receive, send)
+            return
+
+        response = PlainTextResponse("Not Found", status_code=404)
+        await response(scope, receive, send)
 
     def _register_handlers(self) -> None:
         @self.sdk.list_tools()
@@ -220,8 +236,9 @@ class EngineeringAutomationServer:
             client_id = self._current_client_id()
             await self.rate_limiter.consume(client_id, RateLimitTier.RESOURCE)
             self._register_current_session()
+            uri_text = str(uri)
             try:
-                page = await self._resources.read_resource(uri)
+                page = await self._resources.read_resource(uri_text)
             except CursorValidationError:
                 await self.rate_limiter.record_hmac_failure(client_id)
                 raise
@@ -234,12 +251,12 @@ class EngineeringAutomationServer:
 
         @self.sdk.subscribe_resource()
         async def subscribe_resource(uri: str) -> None:
-            self._subscriptions.subscribe(self._current_client_id(), uri)
+            self._subscriptions.subscribe(self._current_client_id(), str(uri))
             self._register_current_session()
 
         @self.sdk.unsubscribe_resource()
         async def unsubscribe_resource(uri: str) -> None:
-            self._subscriptions.unsubscribe(self._current_client_id(), uri)
+            self._subscriptions.unsubscribe(self._current_client_id(), str(uri))
 
     def _register_current_session(self) -> None:
         context = self.sdk.request_context
@@ -342,6 +359,14 @@ class EngineeringAutomationServer:
                 await self.db.set_system_state("cursor_decode_total", value_integer=0)
                 await self.db.set_system_state("cursor_decode_failures", value_integer=0)
                 await self._emit_log_message("WARN", "Cursor secret rotated after elevated HMAC failures.")
+
+
+class _ServerApp:
+    def __init__(self, server: EngineeringAutomationServer) -> None:
+        self._server = server
+
+    async def __call__(self, scope, receive, send) -> None:
+        await self._server._asgi_app(scope, receive, send)
 
 
 server = EngineeringAutomationServer()

@@ -1,0 +1,19 @@
+{
+  "task_id": "ask-approval-demo",
+  "reason": "verify approval flow",
+  "environment": {
+    "target": "dev"
+  },
+  "patch": [
+    {
+      "op": "test",
+      "path": "/status",
+      "value": "pending"
+    },
+    {
+      "op": "test",
+      "path": "/etag",
+      "value": 2
+    }
+  ]
+}
