@@ -1,13 +1,10 @@
 from __future__ import annotations
 
-import asyncio
-
-from .server import EngineeringAutomationServer
+import uvicorn
 
 
 def main() -> int:
-    server = EngineeringAutomationServer()
-    asyncio.run(server.serve())
+    uvicorn.run("engauto_mcp.server:app", host="0.0.0.0", port=8000, lifespan="on")
     return 0
 
 

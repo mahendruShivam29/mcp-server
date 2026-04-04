@@ -5,148 +5,68 @@ import asyncio
 import contextlib
 import json
 import os
+from collections.abc import AsyncIterator
 from pathlib import Path
 import sys
-from collections.abc import Awaitable, Callable
 from typing import Any
 
+from mcp import types
+from mcp.client.session import ClientSession
+from mcp.client.sse import sse_client
 from openai import OpenAI
 
 from .errors import JsonRpcError
-from .jsonrpc import JsonRpcPeer, StdIOTransport, encode_message, read_message_async
 from .models import SamplingRequest, SamplingResponse
-from .server import EngineeringAutomationServer
 
-SamplingHandler = Callable[[SamplingRequest], Awaitable[SamplingResponse]]
 TASK_STATUSES = ("pending", "running", "completed", "failed")
 TERMINAL_TASK_STATUSES = {"completed", "failed"}
 
 
-class _FrameWriter:
-    def __init__(self, write_fn: Callable[[bytes], Awaitable[None]]) -> None:
-        self._write_fn = write_fn
-        self._stdout_lock = asyncio.Lock()
-
-    async def write_message(self, payload: dict[str, Any]) -> None:
-        frame = encode_message(payload)
-        async with self._stdout_lock:
-            await self._write_fn(frame)
-
-
-class SubprocessTransport:
-    def __init__(self, process: asyncio.subprocess.Process) -> None:
-        self._process = process
-        self._writer = _FrameWriter(self._write_frame)
-
-    async def read_message(self) -> dict[str, Any] | None:
-        if self._process.stdout is None:
-            return None
-        return await read_message_async(self._process.stdout)
-
-    async def write_message(self, payload: dict[str, Any]) -> None:
-        await self._writer.write_message(payload)
-
-    async def _write_frame(self, frame: bytes) -> None:
-        if self._process.stdin is None:
-            raise RuntimeError("Client subprocess stdin is not available.")
-        self._process.stdin.write(frame)
-        await self._process.stdin.drain()
-
-    async def close(self) -> None:
-        if self._process.stdin is not None:
-            self._process.stdin.close()
-            wait_closed = getattr(self._process.stdin, "wait_closed", None)
-            if callable(wait_closed):
-                with contextlib.suppress(BrokenPipeError, ConnectionResetError, OSError):
-                    await wait_closed()
-
-
-class ClientStdIOTransport:
-    def __init__(self) -> None:
-        self._transport = StdIOTransport()
-        self._writer = _FrameWriter(self._write_frame)
-
-    async def read_message(self) -> dict[str, Any] | None:
-        return await self._transport.read_message()
-
-    async def write_message(self, payload: dict[str, Any]) -> None:
-        await self._writer.write_message(payload)
-
-    async def _write_frame(self, frame: bytes) -> None:
-        await self._transport.write_message_bytes(frame)
-
-    async def close(self) -> None:
-        return None
-
-
-class _QueueTransport:
-    def __init__(self, reader: asyncio.Queue[dict[str, Any] | None], writer: asyncio.Queue[dict[str, Any] | None]) -> None:
-        self._reader = reader
-        self._writer = writer
-
-    async def read_message(self) -> dict[str, Any] | None:
-        return await self._reader.get()
-
-    async def write_message(self, payload: dict[str, Any]) -> None:
-        await self._writer.put(payload)
-
-    async def close(self) -> None:
-        return None
-
-
 class MCPClient:
-    def __init__(
-        self,
-        process: asyncio.subprocess.Process | None = None,
-        sampling_handler: SamplingHandler | None = None,
-        transport: Any | None = None,
-    ) -> None:
-        if transport is not None:
-            self._transport = transport
-        elif process is not None:
-            self._transport = SubprocessTransport(process)
-        else:
-            raise ValueError("Either a subprocess or transport must be provided.")
-        self._sampling_handler = sampling_handler or self._default_sampling_handler
-        self._peer = JsonRpcPeer(
-            self._transport.read_message,
-            self._transport.write_message,
-            self._handle_request,
-            self._handle_notification,
-        )
-        self._reader_task: asyncio.Task[None] | None = None
-
-    async def start(self) -> None:
-        self._reader_task = asyncio.create_task(self._peer.serve_forever())
-        await self._peer.send_request(
-            "initialize",
-            {"capabilities": {"sampling": {}}},
-        )
-        await self._peer.send_notification("notifications/initialized", {})
-
-    async def stop(self) -> None:
-        if self._reader_task is not None:
-            self._reader_task.cancel()
-            await asyncio.gather(self._reader_task, return_exceptions=True)
-            self._reader_task = None
-        close_transport = getattr(self._transport, "close", None)
-        if callable(close_transport):
-            await close_transport()
+    def __init__(self, session: ClientSession) -> None:
+        self._session = session
 
     async def list_resources(self) -> dict[str, Any]:
-        return await self._peer.send_request("resources/list", {})
+        result = await self._session.list_resources()
+        return {"resources": [resource.model_dump(exclude_none=True) for resource in result.resources]}
 
     async def list_templates(self) -> dict[str, Any]:
-        return await self._peer.send_request("resources/templates/list", {})
+        result = await self._session.list_resource_templates()
+        return {
+            "resourceTemplates": [
+                template.model_dump(exclude_none=True)
+                for template in result.resourceTemplates
+            ]
+        }
 
     async def read_resource(self, uri: str) -> dict[str, Any]:
-        return await self._peer.send_request("resources/read", {"uri": uri})
+        result = await self._session.read_resource(uri)
+        contents = result.contents
+        if not contents:
+            return {"uri": uri, "contents": []}
+        first = contents[0]
+        text = getattr(first, "text", "")
+        if isinstance(text, str):
+            try:
+                return json.loads(text)
+            except json.JSONDecodeError:
+                return {
+                    "uri": uri,
+                    "contents": [content.model_dump(exclude_none=True) for content in contents],
+                }
+        return {"uri": uri, "contents": [content.model_dump(exclude_none=True) for content in contents]}
 
     async def list_tools(self) -> dict[str, Any]:
-        return await self._peer.send_request("tools/list", {})
+        result = await self._session.list_tools()
+        return {"tools": [tool.model_dump(exclude_none=True) for tool in result.tools]}
 
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-        return await self._peer.send_request("tools/call", {"name": name, "arguments": arguments})
+        result = await self._session.call_tool(name, arguments)
+        if result.isError:
+            raise _tool_error_to_jsonrpc(result)
+        if result.structuredContent is not None:
+            return dict(result.structuredContent)
+        return _content_blocks_to_payload(result.content)
 
     async def call_tool_with_policy(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         mutable_arguments = json.loads(json.dumps(arguments))
@@ -161,10 +81,11 @@ class MCPClient:
                     retry_after = float((error.data or {}).get("retry_after", 0))
                     await asyncio.sleep(retry_after)
                     continue
-                # The deployment tools rely on JSON Patch "test" operations for /status and /etag
-                # as an optimistic concurrency guard. If the server returns -32003, the task was
-                # changed after the caller last read it. Re-reading the resource and updating those
-                # test values prevents a stale patch from silently applying to a newer task version.
+                # Deployment uses JSON Patch test operations on /status and /etag as an
+                # optimistic concurrency check. If the task changed after the caller last
+                # read it, the server rejects the request with a TOCTOU conflict. Re-reading
+                # the resource and updating those test values ensures the retry applies only
+                # to the latest task version instead of silently overwriting stale state.
                 if error.code == -32003 and await self._repair_patch_from_resource(
                     mutable_arguments,
                     error.data,
@@ -172,26 +93,31 @@ class MCPClient:
                     continue
                 raise
 
-    async def _handle_request(self, message: dict[str, Any]) -> dict[str, Any]:
-        if message["method"] == "sampling/createMessage":
-            request = SamplingRequest.model_validate(message.get("params", {}))
-            response = await self._sampling_handler(request)
-            return response.model_dump()
-        raise JsonRpcError(-32601, f"Method '{message['method']}' is not supported by the client.")
+    async def _await_deployment_terminal_state(
+        self,
+        arguments: dict[str, Any],
+        result: dict[str, Any],
+    ) -> dict[str, Any]:
+        task_id = arguments.get("task_id")
+        if not isinstance(task_id, str) or not task_id:
+            return result
 
-    async def _handle_notification(self, message: dict[str, Any]) -> None:
-        if message.get("method") == "notifications/logging/message":
-            params = message.get("params", {})
-            print(json.dumps({"log": params}, ensure_ascii=True), file=sys.stderr)
-
-    async def _default_sampling_handler(self, request: SamplingRequest) -> SamplingResponse:
-        patch = None
-        if request.original_error:
-            patch = [{"op": "test", "path": "/status", "value": request.current_status}]
-            actual = request.original_error.get("data", {}).get("actual", {})
-            if "etag" in actual:
-                patch.append({"op": "test", "path": "/etag", "value": actual["etag"]})
-        return SamplingResponse(approved=True, patch=patch, message="Auto-approved remediation")
+        deadline = asyncio.get_running_loop().time() + 5.0
+        await asyncio.sleep(0.35)
+        delay = 0.1
+        latest = result
+        while asyncio.get_running_loop().time() < deadline:
+            task = await _find_task_item(self, task_id)
+            if task is not None:
+                latest = {
+                    "task_id": task["id"],
+                    "status": task["status"],
+                    "etag": task["etag"],
+                }
+                if task["status"] in TERMINAL_TASK_STATUSES:
+                    return latest
+            await asyncio.sleep(delay)
+        return latest
 
     async def _repair_patch_from_resource(
         self,
@@ -230,76 +156,113 @@ class MCPClient:
             arguments["_last_reread_resource_uri"] = resource_uri
         return repaired
 
-    async def _await_deployment_terminal_state(
-        self,
-        arguments: dict[str, Any],
-        result: dict[str, Any],
-    ) -> dict[str, Any]:
-        task_id = arguments.get("task_id")
-        if not isinstance(task_id, str) or not task_id:
-            return result
 
-        deadline = asyncio.get_running_loop().time() + 5.0
-        await asyncio.sleep(0.35)
-        delay = 0.1
-        latest = result
-        while asyncio.get_running_loop().time() < deadline:
-            task = await _find_task_item(self, task_id)
-            if task is not None:
-                latest = {
-                    "task_id": task["id"],
-                    "status": task["status"],
-                    "etag": task["etag"],
+def _content_blocks_to_payload(content_blocks: list[Any]) -> dict[str, Any]:
+    if len(content_blocks) == 1 and getattr(content_blocks[0], "type", None) == "text":
+        text = getattr(content_blocks[0], "text", "")
+        if isinstance(text, str):
+            try:
+                payload = json.loads(text)
+                if isinstance(payload, dict):
+                    return payload
+            except json.JSONDecodeError:
+                return {"text": text}
+    return {"content": [block.model_dump(exclude_none=True) for block in content_blocks]}
+
+
+def _tool_error_to_jsonrpc(result: types.CallToolResult) -> JsonRpcError:
+    if isinstance(result.structuredContent, dict):
+        error_payload = result.structuredContent.get("error")
+        if isinstance(error_payload, dict):
+            return JsonRpcError(
+                int(error_payload.get("code", -32603)),
+                str(error_payload.get("message", "Tool call failed.")),
+                error_payload.get("data"),
+            )
+
+    payload = _content_blocks_to_payload(result.content)
+    if "error" in payload and isinstance(payload["error"], dict):
+        error_payload = payload["error"]
+        return JsonRpcError(
+            int(error_payload.get("code", -32603)),
+            str(error_payload.get("message", "Tool call failed.")),
+            error_payload.get("data"),
+        )
+    return JsonRpcError(-32603, json.dumps(payload))
+
+
+async def _logging_callback(params: types.LoggingMessageNotificationParams) -> None:
+    print(
+        json.dumps(
+            {
+                "log": {
+                    "level": params.level,
+                    "logger": params.logger,
+                    "data": params.data,
                 }
-                if task["status"] in TERMINAL_TASK_STATUSES:
-                    return latest
-            await asyncio.sleep(delay)
-        return latest
-
-    async def run_stdio_forever(self) -> None:
-        self._reader_task = asyncio.create_task(self._peer.serve_forever())
-        await self._reader_task
-
-
-async def _spawn_server(command: list[str]) -> asyncio.subprocess.Process:
-    return await asyncio.create_subprocess_exec(
-        *command,
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=None,
+            },
+            ensure_ascii=True,
+        ),
+        file=sys.stderr,
     )
 
 
-async def _start_in_process_server() -> tuple[MCPClient, EngineeringAutomationServer, asyncio.Task[None]]:
-    client_to_server: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
-    server_to_client: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
-    server = EngineeringAutomationServer()
-    server.transport = _QueueTransport(client_to_server, server_to_client)
-    await server.start()
-    assert server.peer is not None
-    server_task = asyncio.create_task(server.peer.serve_forever())
-    client = MCPClient(transport=_QueueTransport(server_to_client, client_to_server))
-    await client.start()
-    return client, server, server_task
+async def _sampling_callback(
+    context: Any,
+    params: types.CreateMessageRequestParams,
+) -> types.CreateMessageResult:
+    request = _parse_sampling_request(params)
+    response = _build_sampling_response(request)
+    return types.CreateMessageResult(
+        role="assistant",
+        model="engauto-mcp-client",
+        content=types.TextContent(type="text", text=json.dumps(response.model_dump())),
+        stopReason="endTurn",
+    )
 
 
-async def _shutdown_process(process: asyncio.subprocess.Process) -> None:
-    transport = getattr(process, "_transport", None)
-    try:
-        if process.returncode is None:
-            with contextlib.suppress(ProcessLookupError):
-                process.terminate()
-            try:
-                await asyncio.wait_for(process.wait(), timeout=5.0)
-            except asyncio.TimeoutError:
-                with contextlib.suppress(ProcessLookupError):
-                    process.kill()
-                await asyncio.wait_for(process.wait(), timeout=5.0)
-    finally:
-        if transport is not None:
-            with contextlib.suppress(RuntimeError, OSError):
-                transport.close()
-        await asyncio.sleep(0)
+def _parse_sampling_request(params: types.CreateMessageRequestParams) -> SamplingRequest:
+    for message in params.messages:
+        content = getattr(message, "content", None)
+        if getattr(content, "type", None) == "text":
+            text = getattr(content, "text", "")
+            if isinstance(text, str):
+                try:
+                    return SamplingRequest.model_validate(json.loads(text))
+                except Exception:
+                    continue
+    return SamplingRequest(
+        reason="Sampling request",
+        task_id="unknown",
+        current_status="unknown",
+        environment={},
+        diff={},
+    )
+
+
+def _build_sampling_response(request: SamplingRequest) -> SamplingResponse:
+    patch = None
+    if request.original_error:
+        patch = [{"op": "test", "path": "/status", "value": request.current_status}]
+        actual = request.original_error.get("data", {}).get("actual", {})
+        if "etag" in actual:
+            patch.append({"op": "test", "path": "/etag", "value": actual["etag"]})
+    return SamplingResponse(approved=True, patch=patch, message="Auto-approved remediation")
+
+
+@contextlib.asynccontextmanager
+async def _get_mcp_client(server_url: str) -> AsyncIterator[MCPClient]:
+    async with sse_client(server_url) as (read_stream, write_stream):
+        async with ClientSession(
+            read_stream,
+            write_stream,
+            sampling_callback=_sampling_callback,
+            sampling_capabilities=types.SamplingCapability(),
+            logging_callback=_logging_callback,
+            client_info=types.Implementation(name="engauto-mcp-client", version="0.1.0"),
+        ) as session:
+            await session.initialize()
+            yield MCPClient(session)
 
 
 async def _run_shell(client: MCPClient) -> int:
@@ -357,9 +320,6 @@ async def _read_resource_with_policy(client: MCPClient, uri: str) -> dict[str, A
             return await client.read_resource(uri)
         except JsonRpcError as error:
             if error.code != -32002:
-                if error.code == -32603 and "cannot start a transaction within a transaction" in error.message:
-                    await asyncio.sleep(0.1)
-                    continue
                 raise
             retry_after = float((error.data or {}).get("retry_after", 0))
             await asyncio.sleep(retry_after)
@@ -435,21 +395,7 @@ async def _finalize_planned_tool_call(
 
 
 async def _run_cli(args: argparse.Namespace) -> int:
-    if args.command == "stdio-proxy":
-        client = MCPClient(transport=ClientStdIOTransport())
-        await client.run_stdio_forever()
-        return 0
-
-    process: asyncio.subprocess.Process | None = None
-    server: EngineeringAutomationServer | None = None
-    server_task: asyncio.Task[None] | None = None
-    try:
-        process = await _spawn_server(args.server_command)
-        client = MCPClient(process)
-        await client.start()
-    except (PermissionError, NotImplementedError, OSError, RuntimeError):
-        client, server, server_task = await _start_in_process_server()
-    try:
+    async with _get_mcp_client(args.server_url) as client:
         if args.command == "resources-list":
             print(json.dumps(await client.list_resources(), indent=2))
         elif args.command == "templates-list":
@@ -479,34 +425,6 @@ async def _run_cli(args: argparse.Namespace) -> int:
         elif args.command == "shell":
             return await _run_shell(client)
         return 0
-    finally:
-        await client.stop()
-        if server_task is not None:
-            server_task.cancel()
-            await asyncio.gather(server_task, return_exceptions=True)
-        if server is not None:
-            await server.stop()
-        if process is not None:
-            if process.stdin is not None:
-                with contextlib.suppress(BrokenPipeError, ConnectionResetError, OSError):
-                    process.stdin.close()
-                    wait_closed = getattr(process.stdin, "wait_closed", None)
-                    if callable(wait_closed):
-                        await wait_closed()
-            if process.returncode is None:
-                with contextlib.suppress(ProcessLookupError):
-                    process.terminate()
-                try:
-                    await asyncio.wait_for(process.wait(), timeout=5.0)
-                except asyncio.TimeoutError:
-                    with contextlib.suppress(ProcessLookupError):
-                        process.kill()
-                    await asyncio.wait_for(process.wait(), timeout=5.0)
-            transport = getattr(process, "_transport", None)
-            if transport is not None:
-                with contextlib.suppress(RuntimeError, OSError):
-                    transport.close()
-            await asyncio.sleep(0)
 
 
 async def _plan_tool_call_with_openai(
@@ -572,7 +490,7 @@ def _infer_task_resource_uri(query: str) -> str | None:
     lowered = query.lower()
     if "task" not in lowered:
         return None
-    for status in ("pending", "running", "completed", "failed"):
+    for status in TASK_STATUSES:
         if status in lowered:
             return f"tasks://{status}"
     return None
@@ -612,6 +530,7 @@ async def _maybe_handle_direct_query(client: MCPClient, query: str) -> dict[str,
 def _mentions_any(query: str, phrases: tuple[str, ...]) -> bool:
     return any(phrase in query for phrase in phrases)
 
+
 def _build_openai_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
     tool_definitions: list[dict[str, Any]] = []
     for tool in tools:
@@ -638,26 +557,16 @@ def _build_openai_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return tool_definitions
 
 
-def _default_server_command() -> list[str]:
-    if os.name == "nt":
-        root = Path(__file__).resolve().parents[2]
-        return [
-            "powershell",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-File",
-            str(root / "scripts" / "run_server.ps1"),
-        ]
-    return [sys.executable, "-m", "engauto_mcp"]
+def _default_server_url() -> str:
+    return os.environ.get("ENGAUTO_MCP_SERVER_URL", "http://localhost:8000/sse")
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Minimal MCP stdio client for EngAuto-MCP")
+    parser = argparse.ArgumentParser(description="Minimal MCP SSE client for EngAuto-MCP")
     parser.add_argument(
-        "--server-command",
-        nargs="+",
-        default=_default_server_command(),
-        help="Server command to execute",
+        "--server-url",
+        default=_default_server_url(),
+        help="SSE server URL",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("resources-list")
@@ -672,7 +581,6 @@ def build_parser() -> argparse.ArgumentParser:
     ask = subparsers.add_parser("ask")
     ask.add_argument("query")
     subparsers.add_parser("shell")
-    subparsers.add_parser("stdio-proxy")
     return parser
 
 
@@ -690,4 +598,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
